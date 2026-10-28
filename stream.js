@@ -25,21 +25,18 @@ const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)'
 const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
 const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
 
-// Auto-refresh interval (9 mins) for unstable web players
 const FORCE_REFRESH_MS = 9 * 60 * 1000;
 const NO_REFRESH_DOMAINS = [
     'youtube.com', 'facebook.com', 'streamed.pk', 'cricstreams.',
     'sport4u.online', 'vercel.app', 'netlify.app'
 ];
 
-// Resolution & Bitrate Mapping
 let RES_W = 1280, RES_H = 720, BITRATE = 3000;
 if (selectedQuality === '360p') { RES_W = 640; RES_H = 360; BITRATE = 800; }
 else if (selectedQuality === '480p') { RES_W = 854; RES_H = 480; BITRATE = 1500; }
 else if (selectedQuality === '720p') { RES_W = 1280; RES_H = 720; BITRATE = 3000; }
 else if (selectedQuality.includes('1080p')) { RES_W = 1920; RES_H = 1080; BITRATE = 4500; }
 
-// OK.ru Channel Stream Keys
 const STREAM_KEYS = {
     '1'    : '15254238731883_15281627925099_najspfkgne',
     '1.1'  : '15254260751979_15281671637611_2plrcfqzze',
@@ -102,7 +99,7 @@ const STREAM_KEYS = {
 const ACTIVE_STREAM_KEY = STREAM_KEYS[SELECTED_CHANNEL] || STREAM_KEYS['1'];
 
 // =========================================================================================
-// 🔗 SIMPLE MULTI-URL PARSER (Comma or Pipe separated)
+// 🔗 MULTI-URL PARSER
 // =========================================================================================
 const rawUrls = (process.env.TARGET_URLS || 'https://dadocric.st/player.php?id=starsp3&v=m').trim();
 const urlList = rawUrls
@@ -125,29 +122,42 @@ console.log(`[🚀] Engine Locked: ${RES_W}x${RES_H} @ ${BITRATE}kbps | Channel:
 console.log(`[📋] Loaded ${urlList.length} URLs for Failover:`, urlList);
 
 // =========================================================================================
-// 🎥 OBS CONFIGURATION
+// 🎥 OBS CONFIGURATION (With OBS 30+ WebSocket Plugin Fix)
 // =========================================================================================
 function setupOBSConfig() {
     const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
     const profilesDir = path.join(obsDir, 'basic', 'profiles', 'Untitled');
     const scenesDir = path.join(obsDir, 'basic', 'scenes');
+    const wsPluginDir = path.join(obsDir, 'plugin_config', 'obs-websocket');
 
     fs.mkdirSync(profilesDir, { recursive: true });
     fs.mkdirSync(scenesDir, { recursive: true });
+    fs.mkdirSync(wsPluginDir, { recursive: true });
 
-    fs.writeFileSync(path.join(obsDir, 'global.ini'), `[General]\nLicenseAccepted=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n[OBSWebSocket]\nServerEnabled=true\nServerPort=4455\nServerPassword=secret\n`);
+    // Legacy + Modern OBS WebSocket Config
+    fs.writeFileSync(path.join(obsDir, 'global.ini'), `[General]\nLicenseAccepted=true\nFirstRun=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n[OBSWebSocket]\nServerEnabled=true\nServerPort=4455\nServerPassword=secret\n`);
+
+    fs.writeFileSync(path.join(wsPluginDir, 'config.json'), JSON.stringify({
+        alerts_enabled: false,
+        auth_required: true,
+        first_load: false,
+        server_enabled: true,
+        server_password: "secret",
+        server_port: 4455
+    }, null, 2));
 
     fs.writeFileSync(path.join(profilesDir, 'basic.ini'), `[General]\nName=Untitled\n[Video]\nBaseCX=${RES_W}\nBaseCY=${RES_H}\nOutputCX=${RES_W}\nOutputCY=${RES_H}\nFPSCommon=30\n[Output]\nMode=Advanced\n[AdvOut]\nTrackIndex=1\nRecType=Standard\nEncoder=obs_x264\n[obs_x264]\nbitrate=${BITRATE}\nkeyint_sec=2\npreset=ultrafast\nprofile=main\ntune=zerolatency\n`);
 
     const serviceJson = {
-        settings: { server: "rtmp://vsu.okcdn.ru/input/", key: ACTIVE_STREAM_KEY },
+        settings: { server: "rtmp://vsu.okcdn.ru/input/", key: ACTIVE_STREAM_KEY.trim() },
         type: "rtmp_custom"
     };
     fs.writeFileSync(path.join(profilesDir, 'service.json'), JSON.stringify(serviceJson, null, 2));
 
+    // MainScene set as default so video + audio broadcast even if WebSocket is delayed
     const sceneJson = {
-        current_scene: "WaitingScene",
-        current_program_scene: "WaitingScene",
+        current_scene: "MainScene",
+        current_program_scene: "MainScene",
         name: "Untitled",
         scene_order: [{ name: "WaitingScene" }, { name: "MainScene" }],
         sources: [
@@ -158,6 +168,19 @@ function setupOBSConfig() {
         ]
     };
     fs.writeFileSync(path.join(scenesDir, 'Untitled.json'), JSON.stringify(sceneJson, null, 2));
+}
+
+// =========================================================================================
+// 🪟 HIDE OBS WINDOW & FORCE CHROME ON TOP (X11 / Xvfb Fix)
+// =========================================================================================
+function keepChromeOnTopAndHideOBS() {
+    try {
+        // Move OBS window far off-screen and minimize it so it never appears on stream
+        execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
+        // Force Chrome window to 0,0 with full resolution and bring to front
+        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
+        execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
+    } catch (e) {}
 }
 
 // =========================================================================================
@@ -211,12 +234,11 @@ async function hideLoadingOverlay(p) {
 }
 
 // =========================================================================================
-// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK
+// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Supports Nested Iframes like webcric)
 // =========================================================================================
 async function lockAndPlayVideo(p) {
     if (!p) return;
     try {
-        // 1. Optional Server Button Selection
         if (SERVER_SELECTION !== 'None') {
             await p.evaluate((srv) => {
                 const btn = Array.from(document.querySelectorAll('button, a, div')).find(b => b.innerText && b.innerText.trim().includes(srv));
@@ -225,14 +247,14 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 2000));
         }
 
-        // 2. Click Play / Unmute across all frames
+        // Click Play / Unmute across all frames
         for (let attempt = 0; attempt < 8; attempt++) {
             let playing = false;
             for (const frame of p.frames()) {
                 if (frame.isDetached()) continue;
                 try {
                     const status = await frame.evaluate((audioEnabled) => {
-                        const playSelectors = '.jw-icon-display, button[data-plyr="play"], .vjs-big-play-button, [class*="unmute"], .fp-play, video';
+                        const playSelectors = '.jw-icon-display, button[data-plyr="play"], .vjs-big-play-button, [class*="unmute"], .fp-play, .clappr-player, video';
                         document.querySelectorAll(playSelectors).forEach(el => { try { el.click(); } catch(e){} });
 
                         let isPlaying = false;
@@ -251,39 +273,38 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 1500));
         }
 
-        // 3. Stretch Largest Player Iframe on Main Page (Guard against duplicate intervals)
-        await p.evaluate(() => {
-            if (window.__mainIframeLocked) return;
-            window.__mainIframeLocked = true;
-            setInterval(() => {
-                const iframes = Array.from(document.querySelectorAll('iframe'));
-                let best = null, maxArea = 5000;
-                iframes.forEach(f => {
-                    const area = f.clientWidth * f.clientHeight;
-                    if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
-                });
-                if (best) {
-                    iframes.forEach(f => { if (f !== best) f.style.setProperty('display', 'none', 'important'); });
-                    best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;';
-                }
-            }, 1000);
-        }).catch(() => {});
-
-        // 4. Stretch Video Element inside Target Frame (Guard against memory leak)
+        // Stretch largest iframe OR video inside EVERY frame (fixes nested iframes on webcric)
         for (const frame of p.frames()) {
             if (frame.isDetached()) continue;
             await frame.evaluate((audioEnabled) => {
-                if (window.__playerLockActive) return;
-                window.__playerLockActive = true;
+                if (window.__frameLockActive) return;
+                window.__frameLockActive = true;
                 setInterval(() => {
+                    document.documentElement.style.setProperty('background', '#000', 'important');
+                    if (document.body) document.body.style.setProperty('background', '#000', 'important');
+
                     const v = document.querySelector('video');
-                    if (!v) return;
-                    v.muted = !audioEnabled;
-                    v.volume = audioEnabled ? 1.0 : 0.0;
-                    const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player]') || v;
-                    wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
-                    v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
-                    document.querySelectorAll('.jw-controls, .plyr__controls, .vjs-control-bar').forEach(c => c.style.setProperty('display', 'none', 'important'));
+                    if (v && (v.clientWidth > 50 || !v.paused)) {
+                        v.muted = !audioEnabled;
+                        v.volume = audioEnabled ? 1.0 : 0.0;
+                        const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player], .player-poster') || v;
+                        wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
+                        v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
+                        document.querySelectorAll('.jw-controls, .plyr__controls, .vjs-control-bar').forEach(c => c.style.setProperty('display', 'none', 'important'));
+                        return;
+                    }
+
+                    // If this frame only hosts child iframes, maximize the main player iframe
+                    const iframes = Array.from(document.querySelectorAll('iframe'));
+                    let best = null, maxArea = 5000;
+                    iframes.forEach(f => {
+                        const area = f.clientWidth * f.clientHeight;
+                        if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
+                    });
+                    if (best) {
+                        iframes.forEach(f => { if (f !== best) f.style.setProperty('display', 'none', 'important'); });
+                        best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;display:block !important;visibility:visible !important;';
+                    }
                 }, 1000);
             }, ENABLE_STREAM_AUDIO).catch(() => {});
         }
@@ -326,11 +347,14 @@ async function loadCurrentUrl(reason) {
     try { await obs.call('SetCurrentProgramScene', { sceneName: 'WaitingScene' }); } catch (e) {}
     try {
         await page.goto('about:blank');
+        await page.bringToFront();
+        keepChromeOnTopAndHideOBS();
         await showLoadingOverlay(page, "CONNECTING STREAM", `Server ${currentUrlIndex + 1} of ${urlList.length}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await showLoadingOverlay(page, "OPTIMIZING PLAYER", "Locking fullscreen video...");
         await lockAndPlayVideo(page);
         await hideLoadingOverlay(page);
+        keepChromeOnTopAndHideOBS();
     } catch (e) {
         console.log(`[⚠️] Page navigation warning: ${e.message}`);
     }
@@ -345,6 +369,7 @@ async function startWatchdog() {
     while (true) {
         if (!browser || !browser.isConnected()) throw new Error('Browser disconnected');
 
+        keepChromeOnTopAndHideOBS();
         const currentUrl = urlList[currentUrlIndex];
         const health = await checkStreamHealth(page);
 
@@ -365,7 +390,6 @@ async function startWatchdog() {
                 await hideLoadingOverlay(page);
             }
 
-            // Periodic 9-minute auto-refresh for non-exempt domains
             const isExempt = NO_REFRESH_DOMAINS.some(d => currentUrl.includes(d));
             if (!isExempt && (Date.now() - urlStart > FORCE_REFRESH_MS)) {
                 await loadCurrentUrl('SCHEDULED 9-MIN REFRESH');
@@ -383,8 +407,8 @@ async function startWatchdog() {
         }
 
         ticks++;
-        if (ticks % 10 === 0) {
-            console.log(`[💓] HEARTBEAT | Status: ${health.status} | Time: ${health.currentTime ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Active URL [${currentUrlIndex + 1}/${urlList.length}]`);
+        if (ticks === 1 || ticks % 10 === 0) {
+            console.log(`[💓] HEARTBEAT | Status: ${health.status} | Time: ${health.currentTime ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Frames: ${health.frames ?? 'N/A'} | Active URL [${currentUrlIndex + 1}/${urlList.length}]`);
         }
 
         await new Promise(r => setTimeout(r, 2000));
@@ -395,13 +419,41 @@ async function startWatchdog() {
 // 🚀 ENGINE STARTUP & AUTO-RESTART
 // =========================================================================================
 async function startEngine() {
+    console.log('[*] Configuring & Starting OBS Studio...');
     setupOBSConfig();
-    obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray']);
+
+    obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray', '--disable-updater']);
+
+    // Restored OBS Console Logs so you can verify RTMP streaming in GitHub Actions
+    obsProcess.stdout.on('data', (data) => {
+        const line = data.toString().trim();
+        if (line.includes('rtmp') || line.includes('stream') || line.includes('Websocket') || line.includes('output')) {
+            console.log(`[OBS]: ${line}`);
+        }
+    });
+    obsProcess.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg.toLowerCase().includes('error') || msg.toLowerCase().includes('fail')) {
+            console.log(`[OBS Error]: ${msg}`);
+        }
+    });
+
     await new Promise(r => setTimeout(r, 6000));
 
-    for (let i = 0; i < 10; i++) {
-        try { await obs.connect('ws://127.0.0.1:4455', 'secret'); console.log('[+] OBS WebSocket Connected!'); break; }
-        catch (e) { await new Promise(r => setTimeout(r, 2000)); }
+    let obsConnected = false;
+    for (let i = 0; i < 12; i++) {
+        try {
+            await obs.connect('ws://127.0.0.1:4455', 'secret');
+            obsConnected = true;
+            console.log('[+] OBS WebSocket Connected!');
+            break;
+        } catch (e) {
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    if (obsConnected) {
+        try { await obs.call('StartStream'); } catch (e) {}
     }
 
     const args = [
@@ -413,7 +465,6 @@ async function startEngine() {
 
     if (PROXY_ENGINE.includes('Cloudflare')) args.push('--proxy-server=socks5://127.0.0.1:40000');
 
-    // Load uBlock Origin Lite MV3 Extension if extracted in folder
     const ublockPath = path.join(process.cwd(), 'ublock-lite');
     if (fs.existsSync(path.join(ublockPath, 'manifest.json'))) {
         args.push(`--disable-extensions-except=${ublockPath}`);
@@ -430,7 +481,6 @@ async function startEngine() {
 
     page = (await browser.pages())[0];
 
-    // Close any rogue popup tabs immediately (Strict Single-Tab Rule)
     browser.on('targetcreated', async (target) => {
         if (target.type() === 'page') {
             const newPage = await target.page().catch(() => null);
@@ -440,6 +490,7 @@ async function startEngine() {
         }
     });
 
+    keepChromeOnTopAndHideOBS();
     await setupPageProtections(page);
     await loadCurrentUrl('INITIAL BOOT');
     await startWatchdog();
@@ -452,7 +503,6 @@ async function cleanup() {
     try { execSync('pkill -9 obs chrome ffplay || true', { stdio: 'ignore' }); } catch (e) {}
 }
 
-// 5h 50m Auto-Chain before GitHub 6-Hour Runner Timeout
 setTimeout(() => {
     try {
         const cmd = `gh workflow run main.yml -f target_urls="${process.env.TARGET_URLS || ''}" -f okru_stream_channel="${SELECTED_CHANNEL}" -f server_selection="${SERVER_SELECTION}" -f stream_quality="${selectedQuality}" -f proxy_engine="${PROXY_ENGINE}" -f enable_stream_audio="${process.env.ENABLE_STREAM_AUDIO || 'ON'}"`;
