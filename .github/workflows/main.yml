@@ -66,10 +66,10 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install System Dependencies & OBS Studio
+      - name: Install System Dependencies, Openbox & OBS Studio
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl
+          sudo apt-get install -y xvfb openbox pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl
           npm install
 
       - name: Install & Connect Cloudflare WARP Proxy
@@ -109,4 +109,10 @@ jobs:
           pacmd set-default-sink v1
           pacmd set-default-source v1.monitor
 
-          xvfb-run -s "-screen 0 1920x1080x24 -ac -r -extension RANDR" node stream.js
+          # Match Xvfb screen size with selected stream quality
+          SCREEN_RES="1280x720x24"
+          if [[ "$STREAM_QUALITY" == *"1080p"* ]]; then SCREEN_RES="1920x1080x24"; fi
+          if [[ "$STREAM_QUALITY" == "480p" ]]; then SCREEN_RES="854x480x24"; fi
+          if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
+
+          xvfb-run -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
