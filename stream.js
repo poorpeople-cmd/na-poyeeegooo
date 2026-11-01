@@ -25,7 +25,9 @@ const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)'
 const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
 const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
 
-const FORCE_REFRESH_MS = 9 * 60 * 1000;
+// const FORCE_REFRESH_MS = 9 * 60 * 1000;
+const FORCE_REFRESH_MS = 900000000 * 60 * 1000;
+
 const NO_REFRESH_DOMAINS = [
     'youtube.com', 'facebook.com', 'streamed.pk', 'cricstreams.',
     'sport4u.online', 'vercel.app', 'netlify.app'
