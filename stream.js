@@ -227,88 +227,136 @@ async function showLoadingOverlay(p, title, subtitle) {
 }
 
 async function hideLoadingOverlay(p) {
+    if (!p) return;
     try {
-        await p.evaluate(() => {
-            const el = document.getElementById('bot-loading-ui');
-            if (el) el.remove();
-        });
+        await Promise.race([
+            p.evaluate(() => {
+                document.querySelectorAll('#bot-loading-ui').forEach(el => el.remove());
+            }),
+            new Promise(r => setTimeout(r, 1000))
+        ]);
     } catch (e) {}
 }
 
 // =========================================================================================
-// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Supports Nested Iframes like webcric)
+// 🛡️ SAFE FRAME EVALUATOR (Prevents Hanging on Dead/Cross-Origin Iframes)
+// =========================================================================================
+async function evalFrameSafe(frame, fn, ...args) {
+    if (!frame || frame.isDetached()) return null;
+    try {
+        return await Promise.race([
+            frame.evaluate(fn, ...args),
+            new Promise(r => setTimeout(() => r(null), 1500))
+        ]);
+    } catch (e) {
+        return null;
+    }
+}
+
+// =========================================================================================
+// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Supports thedaddy.li & Multi-Layer Iframes)
 // =========================================================================================
 async function lockAndPlayVideo(p) {
     if (!p) return;
     try {
         if (SERVER_SELECTION !== 'None') {
-            await p.evaluate((srv) => {
+            await evalFrameSafe(p.mainFrame(), (srv) => {
                 const btn = Array.from(document.querySelectorAll('button, a, div')).find(b => b.innerText && b.innerText.trim().includes(srv));
                 if (btn) btn.click();
-            }, SERVER_SELECTION).catch(() => {});
+            }, SERVER_SELECTION);
             await new Promise(r => setTimeout(r, 2000));
         }
 
-        // Click Play / Unmute across all frames
+        // Wait 3.5 seconds so dynamic scripts on thedaddy.li can inject the player iframe
+        await new Promise(r => setTimeout(r, 3500));
+
+        // Let the loading overlay pass mouse clicks through to the video player underneath
+        await evalFrameSafe(p.mainFrame(), () => {
+            const ui = document.getElementById('bot-loading-ui');
+            if (ui) ui.style.pointerEvents = 'none';
+        });
+
         for (let attempt = 0; attempt < 8; attempt++) {
             let playing = false;
+
+            // Inject Fullscreen CSS Lock & Play Trigger across ALL current & newly loaded child iframes
             for (const frame of p.frames()) {
-                if (frame.isDetached()) continue;
-                try {
-                    const status = await frame.evaluate((audioEnabled) => {
-                        const playSelectors = '.jw-icon-display, button[data-plyr="play"], .vjs-big-play-button, [class*="unmute"], .fp-play, .clappr-player, video';
-                        document.querySelectorAll(playSelectors).forEach(el => { try { el.click(); } catch(e){} });
+                const status = await evalFrameSafe(frame, (audioEnabled) => {
+                    // 1. Setup persistent interval in every frame (even newly created nested iframes)
+                    if (!window.__frameLockActive) {
+                        window.__frameLockActive = true;
+                        setInterval(() => {
+                            document.documentElement.style.setProperty('background', '#000', 'important');
+                            if (document.body) document.body.style.setProperty('background', '#000', 'important');
 
-                        let isPlaying = false;
-                        document.querySelectorAll('video').forEach(v => {
-                            if (v.paused) v.play().catch(() => {});
-                            v.muted = !audioEnabled;
-                            v.volume = audioEnabled ? 1.0 : 0.0;
-                            if (!v.paused && v.currentTime > 0) isPlaying = true;
-                        });
-                        return isPlaying;
-                    }, ENABLE_STREAM_AUDIO);
-                    if (status) { playing = true; break; }
-                } catch (e) {}
-            }
-            if (playing) break;
-            await new Promise(r => setTimeout(r, 1500));
-        }
+                            const v = document.querySelector('video');
+                            if (v && (v.clientWidth > 50 || !v.paused || v.readyState >= 1)) {
+                                v.muted = !audioEnabled;
+                                v.volume = audioEnabled ? 1.0 : 0.0;
+                                const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player], .player-poster, .clappr-player') || v;
+                                wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
+                                v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
+                                document.querySelectorAll('.jw-controls, .plyr__controls, .vjs-control-bar, .media-control').forEach(c => c.style.setProperty('display', 'none', 'important'));
+                                return;
+                            }
 
-        // Stretch largest iframe OR video inside EVERY frame (fixes nested iframes on webcric)
-        for (const frame of p.frames()) {
-            if (frame.isDetached()) continue;
-            await frame.evaluate((audioEnabled) => {
-                if (window.__frameLockActive) return;
-                window.__frameLockActive = true;
-                setInterval(() => {
-                    document.documentElement.style.setProperty('background', '#000', 'important');
-                    if (document.body) document.body.style.setProperty('background', '#000', 'important');
+                            // Maximize player iframe (ignores chat/ad iframes)
+                            const iframes = Array.from(document.querySelectorAll('iframe')).filter(f => {
+                                const src = (f.src || '').toLowerCase();
+                                return !src.includes('chat') && !src.includes('ad') && !src.includes('banner') && !src.includes('disqus');
+                            });
 
-                    const v = document.querySelector('video');
-                    if (v && (v.clientWidth > 50 || !v.paused)) {
+                            let best = null, maxArea = 1000;
+                            iframes.forEach(f => {
+                                const area = f.clientWidth * f.clientHeight;
+                                if (area > maxArea) { maxArea = area; best = f; }
+                            });
+                            if (!best && iframes.length === 1) best = iframes[0];
+
+                            if (best) {
+                                iframes.forEach(f => { if (f !== best) f.style.setProperty('display', 'none', 'important'); });
+                                best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;display:block !important;visibility:visible !important;';
+                            }
+                        }, 800);
+                    }
+
+                    // 2. Remove transparent ad-shields blocking the video player
+                    document.querySelectorAll('div, a, span').forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        const z = parseInt(style.zIndex, 10);
+                        if (z > 100 && el.id !== 'bot-loading-ui' && !el.querySelector('video') && !el.querySelector('iframe') && !el.className.includes('jw-') && !el.className.includes('vjs-') && !el.className.includes('plyr') && !el.className.includes('clappr')) {
+                            el.remove();
+                        }
+                    });
+
+                    // 3. Click Play & Unmute
+                    const playSelectors = '.jw-icon-display, button[data-plyr="play"], .vjs-big-play-button, [class*="unmute"], .fp-play, .clappr-player, .media-control-button, [aria-label="Play"], video';
+                    document.querySelectorAll(playSelectors).forEach(el => { try { el.click(); } catch (e) {} });
+
+                    let isPlaying = false;
+                    document.querySelectorAll('video').forEach(v => {
+                        if (v.paused) {
+                            v.muted = true; // Start muted first to satisfy browser autoplay rules
+                            v.play().catch(() => {});
+                        }
                         v.muted = !audioEnabled;
                         v.volume = audioEnabled ? 1.0 : 0.0;
-                        const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player], .player-poster') || v;
-                        wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
-                        v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
-                        document.querySelectorAll('.jw-controls, .plyr__controls, .vjs-control-bar').forEach(c => c.style.setProperty('display', 'none', 'important'));
-                        return;
-                    }
-
-                    // If this frame only hosts child iframes, maximize the main player iframe
-                    const iframes = Array.from(document.querySelectorAll('iframe'));
-                    let best = null, maxArea = 5000;
-                    iframes.forEach(f => {
-                        const area = f.clientWidth * f.clientHeight;
-                        if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
+                        if (!v.paused && v.readyState >= 2) isPlaying = true;
                     });
-                    if (best) {
-                        iframes.forEach(f => { if (f !== best) f.style.setProperty('display', 'none', 'important'); });
-                        best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;display:block !important;visibility:visible !important;';
-                    }
-                }, 1000);
-            }, ENABLE_STREAM_AUDIO).catch(() => {});
+                    return isPlaying;
+                }, ENABLE_STREAM_AUDIO);
+
+                if (status) { playing = true; break; }
+            }
+
+            if (playing) break;
+
+            // Real Hardware Mouse Click at screen center (triggers nested iframe players like thedaddy.li)
+            try {
+                await p.mouse.click(Math.floor(RES_W / 2), Math.floor(RES_H / 2));
+            } catch (e) {}
+
+            await new Promise(r => setTimeout(r, 1500));
         }
     } catch (e) {}
 }
@@ -319,22 +367,16 @@ async function lockAndPlayVideo(p) {
 async function checkStreamHealth(p) {
     if (!p) return { status: 'DEAD' };
     try {
-        const checks = p.frames().map(async (frame) => {
-            if (frame.isDetached()) return null;
-            try {
-                return await Promise.race([
-                    frame.evaluate(() => {
-                        const v = document.querySelector('video');
-                        if (v && !v.paused && v.readyState >= 2) {
-                            const frames = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : (v.webkitDecodedFrameCount || 0);
-                            return { status: 'HEALTHY', currentTime: v.currentTime, frames };
-                        }
-                        return null;
-                    }),
-                    new Promise(r => setTimeout(() => r(null), 1500))
-                ]);
-            } catch (e) { return null; }
-        });
+        const checks = p.frames().map(frame =>
+            evalFrameSafe(frame, () => {
+                const v = document.querySelector('video');
+                if (v && !v.paused && v.readyState >= 2) {
+                    const frames = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : (v.webkitDecodedFrameCount || 0);
+                    return { status: 'HEALTHY', currentTime: v.currentTime, frames };
+                }
+                return null;
+            })
+        );
         const results = await Promise.all(checks);
         return results.find(r => r && r.status === 'HEALTHY') || { status: 'LOADING_OR_DEAD' };
     } catch (e) {
@@ -355,10 +397,11 @@ async function loadCurrentUrl(reason) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await showLoadingOverlay(page, "OPTIMIZING PLAYER", "Locking fullscreen video...");
         await lockAndPlayVideo(page);
-        await hideLoadingOverlay(page);
-        keepChromeOnTopAndHideOBS();
     } catch (e) {
         console.log(`[⚠️] Page navigation warning: ${e.message}`);
+    } finally {
+        await hideLoadingOverlay(page);
+        keepChromeOnTopAndHideOBS();
     }
     try { await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' }); } catch (e) {}
 }
@@ -399,11 +442,19 @@ async function startWatchdog() {
             }
         } else {
             deadStrikes++;
-            console.log(`[⚠️] Stream Unhealthy (${health.status}) - Strike ${deadStrikes}/5`);
-            if (deadStrikes >= 5) {
+            console.log(`[⚠️] Stream Unhealthy (${health.status}) - Strike ${deadStrikes}/12`);
+
+            // Re-lock and click player on strikes 3, 6, 9 if iframe loaded late
+            if (deadStrikes % 3 === 0 && deadStrikes < 12) {
+                console.log(`[🔧] Late iframe recovery -> Clicking & locking player...`);
+                await lockAndPlayVideo(page);
+                await hideLoadingOverlay(page);
+            }
+
+            if (deadStrikes >= 12) {
                 deadStrikes = 0;
                 currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-                await loadCurrentUrl('5 STRIKES -> FAILOVER NEXT URL');
+                await loadCurrentUrl('12 STRIKES -> FAILOVER NEXT URL');
                 freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
             }
         }
@@ -418,7 +469,7 @@ async function startWatchdog() {
 }
 
 // =========================================================================================
-// 🚀 ENGINE STARTUP & AUTO-RESTART
+// 🚀 ENGINE STARTUP & AUTO-RESTART (Restored & Updated)
 // =========================================================================================
 async function startEngine() {
     console.log('[*] Configuring & Starting OBS Studio...');
@@ -426,7 +477,6 @@ async function startEngine() {
 
     obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray', '--disable-updater']);
 
-    // Restored OBS Console Logs so you can verify RTMP streaming in GitHub Actions
     obsProcess.stdout.on('data', (data) => {
         const line = data.toString().trim();
         if (line.includes('rtmp') || line.includes('stream') || line.includes('Websocket') || line.includes('output')) {
@@ -463,7 +513,6 @@ async function startEngine() {
         '--window-position=0,0', '--kiosk', '--start-fullscreen',
         '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled', '--use-gl=egl',
-        '--disable-web-security',
         '--disable-site-isolation-trials',
         '--disable-features=IsolateOrigins,site-per-process'
     ];
