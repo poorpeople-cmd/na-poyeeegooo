@@ -47,6 +47,11 @@ on:
           - 'ON'
           - 'OFF'
         default: 'ON'
+      custom_duration:
+        description: 'Stream Duration (e.g., 3h, 180m, 45m, or 24/7)'
+        required: false
+        type: string
+        default: '24/7'
 
 permissions:
   contents: write
@@ -120,6 +125,7 @@ jobs:
           STREAM_QUALITY: ${{ github.event.inputs.stream_quality }}
           PROXY_ENGINE: ${{ github.event.inputs.proxy_engine }}
           ENABLE_STREAM_AUDIO: ${{ github.event.inputs.enable_stream_audio }}
+          CUSTOM_DURATION: ${{ github.event.inputs.custom_duration }}
         run: |
           pulseaudio -D --exit-idle-time=-1
           pacmd load-module module-virtual-sink sink_name=v1
