@@ -504,7 +504,7 @@ async function startWatchdog() {
         }
 
         ticks++;
-        if (ticks === 1 || ticks % 10 === 0) {
+        if (ticks === 1 || ticks % 90 === 0) {
             console.log(`[💓] HEARTBEAT | Status: ${health.status} | Time: ${health.currentTime ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Frames: ${health.frames ?? 'N/A'} | Active URL [${currentUrlIndex + 1}/${urlList.length}]`);
         }
 
