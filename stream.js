@@ -715,13 +715,47 @@ async function cleanup() {
     try { execSync('pkill -9 obs chrome ffplay || true', { stdio: 'ignore' }); } catch (e) {}
 }
 
-setTimeout(() => {
-    try {
-        const cmd = `gh workflow run main.yml -f target_urls="${process.env.TARGET_URLS || ''}" -f okru_stream_channel="${SELECTED_CHANNEL}" -f server_selection="${SERVER_SELECTION}" -f stream_quality="${selectedQuality}" -f proxy_engine="${PROXY_ENGINE}" -f enable_stream_audio="${process.env.ENABLE_STREAM_AUDIO || 'ON'}"`;
-        execSync(cmd, { stdio: 'inherit' });
-        setTimeout(async () => { await cleanup(); process.exit(0); }, 60000);
-    } catch (e) {}
-}, 21000000);
+// =========================================================================================
+// ⏱️ SMART DURATION & 6-HOUR HANDOVER TIMER (Supports 3h, 180m, 24/7)
+// =========================================================================================
+const rawDuration = (process.env.CUSTOM_DURATION || '24/7').trim().toLowerCase();
+const MAX_RUNNER_MS = 21000000; // 5 hours 50 minutes (350 mins)
+let totalDurationMs = Infinity;
+
+if (rawDuration !== '24/7' && rawDuration !== 'none' && rawDuration !== '') {
+    const hMatch = rawDuration.match(/(\d+(\.\d+)?)\s*h/);
+    const mMatch = rawDuration.match(/(\d+)\s*m/);
+    if (hMatch) {
+        totalDurationMs = Math.round(parseFloat(hMatch[1]) * 3600 * 1000);
+    } else if (mMatch) {
+        totalDurationMs = parseInt(mMatch[1], 10) * 60 * 1000;
+    } else if (!isNaN(rawDuration)) {
+        totalDurationMs = parseFloat(rawDuration) * 60 * 1000;
+    }
+}
+
+if (totalDurationMs <= MAX_RUNNER_MS) {
+    console.log(`[⏱️] Stream Duration Set: ${rawDuration} (${Math.round(totalDurationMs / 60000)} mins). Will auto-stop when finished.`);
+    setTimeout(async () => {
+        console.log(`\n[🛑] Scheduled Duration (${rawDuration}) Completed! Stopping stream cleanly...`);
+        await cleanup();
+        process.exit(0);
+    }, totalDurationMs);
+} else {
+    console.log(`[⏱️] Long/24x7 Stream Mode (${rawDuration}). Will handover after 5h 50m.`);
+    setTimeout(() => {
+        try {
+            let nextDuration = '24/7';
+            if (totalDurationMs !== Infinity) {
+                const remMins = Math.max(1, Math.round((totalDurationMs - MAX_RUNNER_MS) / 60000));
+                nextDuration = `${remMins}m`;
+            }
+            const cmd = `gh workflow run main.yml -f target_urls="${process.env.TARGET_URLS || ''}" -f okru_stream_channel="${SELECTED_CHANNEL}" -f server_selection="${SERVER_SELECTION}" -f stream_quality="${selectedQuality}" -f proxy_engine="${PROXY_ENGINE}" -f enable_stream_audio="${process.env.ENABLE_STREAM_AUDIO || 'ON'}" -f custom_duration="${nextDuration}"`;
+            execSync(cmd, { stdio: 'inherit' });
+            setTimeout(async () => { await cleanup(); process.exit(0); }, 60000);
+        } catch (e) {}
+    }, MAX_RUNNER_MS);
+}
 
 (async () => {
     while (true) {
