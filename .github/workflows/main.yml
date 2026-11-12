@@ -72,6 +72,23 @@ jobs:
           sudo apt-get install -y xvfb openbox pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl
           npm install
 
+        
+      - name: Check Chrome and DRM Environment
+        run: |
+          echo "=== Chrome ==="
+          google-chrome --version || true
+
+          echo "=== Chromium ==="
+          chromium --version || true
+
+          echo "=== Display ==="
+          echo "Runner OS: $RUNNER_OS"
+
+          echo "=== Installed Browser ==="
+          which google-chrome || true
+          which chromium || true
+
+
       - name: Install & Connect Cloudflare WARP Proxy
         if: github.event.inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
         run: |
@@ -116,3 +133,151 @@ jobs:
           if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
 
           xvfb-run -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# name: 24/7 OK.ru Simple Stream Bot
+
+# run-name: "OK.ru Live - Channel ${{ inputs.okru_stream_channel }}"
+
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       target_urls:
+#         description: 'Comma-separated Target URLs (Server1, Server2, Server3)'
+#         required: true
+#         type: string
+#         default: 'https://dadocric.st/player.php?id=starsp3&v=m'
+#       okru_stream_channel:
+#         description: 'OK.ru Broadcast Channel (e.g., 1, 1.1, 2, s1.1)'
+#         required: true
+#         type: string
+#         default: '1'
+#       server_selection:
+#         description: 'Target Server Button on Page - Type "None" to skip'
+#         required: true
+#         type: string
+#         default: 'None'
+#       stream_quality:
+#         description: 'Select Stream Quality'
+#         required: true
+#         type: choice
+#         options:
+#           - 'Original (1080p Max)'
+#           - '1080p'
+#           - '720p'
+#           - '480p'
+#           - '360p'
+#         default: '720p'
+#       proxy_engine:
+#         description: 'Network Proxy Engine'
+#         required: true
+#         type: choice
+#         options:
+#           - 'Cloudflare WARP (Recommended)'
+#           - 'None (Direct GitHub IP)'
+#         default: 'Cloudflare WARP (Recommended)'
+#       enable_stream_audio:
+#         description: 'Stream Audio (ON / OFF)'
+#         required: true
+#         type: choice
+#         options:
+#           - 'ON'
+#           - 'OFF'
+#         default: 'ON'
+
+# permissions:
+#   contents: write
+#   actions: write
+
+# jobs:
+#   stream:
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 360
+
+#     steps:
+#       - name: Checkout Repository (2026 v6)
+#         uses: actions/checkout@v6
+
+#       - name: Setup Node.js 24 LTS (2026 v6)
+#         uses: actions/setup-node@v6
+#         with:
+#           node-version: '24'
+
+#       - name: Install System Dependencies, Openbox & OBS Studio
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install -y xvfb openbox pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl
+#           npm install
+
+#       - name: Install & Connect Cloudflare WARP Proxy
+#         if: github.event.inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
+#         run: |
+#           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+#           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+#           sudo apt-get update && sudo apt-get install -y cloudflare-warp
+#           warp-cli --accept-tos registration new
+#           warp-cli --accept-tos mode proxy
+#           warp-cli --accept-tos proxy port 40000
+#           warp-cli --accept-tos connect
+#           sleep 5
+#           echo "[+] Cloudflare WARP Connected on SOCKS5 127.0.0.1:40000"
+
+#       - name: Fetch Latest 2026 uBlock Origin Lite (MV3)
+#         run: |
+#           LATEST_URL=$(curl -s https://api.github.com/repos/uBlockOrigin/uBOL-home/releases/latest | jq -r '.assets[] | select(.name | endswith(".chromium.zip")) | .browser_download_url' | head -n 1)
+#           echo "[*] Downloading uBOLite from: $LATEST_URL"
+#           wget -q -O ublock-lite.zip "$LATEST_URL"
+#           mkdir -p ublock-lite
+#           unzip -q ublock-lite.zip -d ublock-lite
+#           echo "[+] Latest uBlock Origin Lite Extracted!"
+
+#       - name: Launch Virtual Display & Stream Engine
+#         env:
+#           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#           TARGET_URLS: ${{ github.event.inputs.target_urls }}
+#           OKRU_STREAM_ID: ${{ github.event.inputs.okru_stream_channel }}
+#           SERVER_SELECTION: ${{ github.event.inputs.server_selection }}
+#           STREAM_QUALITY: ${{ github.event.inputs.stream_quality }}
+#           PROXY_ENGINE: ${{ github.event.inputs.proxy_engine }}
+#           ENABLE_STREAM_AUDIO: ${{ github.event.inputs.enable_stream_audio }}
+#         run: |
+#           pulseaudio -D --exit-idle-time=-1
+#           pacmd load-module module-virtual-sink sink_name=v1
+#           pacmd set-default-sink v1
+#           pacmd set-default-source v1.monitor
+
+#           # Match Xvfb screen size with selected stream quality
+#           SCREEN_RES="1280x720x24"
+#           if [[ "$STREAM_QUALITY" == *"1080p"* ]]; then SCREEN_RES="1920x1080x24"; fi
+#           if [[ "$STREAM_QUALITY" == "480p" ]]; then SCREEN_RES="854x480x24"; fi
+#           if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
+
+#           xvfb-run -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
