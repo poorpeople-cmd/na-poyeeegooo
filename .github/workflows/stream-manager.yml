@@ -1,0 +1,348 @@
+name: Always-On Stream Manager (All-In-One Control)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop_time:
+        description: 'Auto-stop time in PKT (e.g., 3:00 AM, 12:00 AM, 12:30 PM) or type "None"'
+        required: true
+        default: '3:00 AM'
+      delete_kachra:
+        description: 'Delete old workflows history (Kachra)?'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  super-manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 Hours Max Limit
+
+    steps:
+      - name: Get Code
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Super Manager Loop (Every 5 Minutes)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          STOP_TIME: ${{ inputs.stop_time }}
+          DELETE_KACHRA: ${{ inputs.delete_kachra }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          cat << 'EOF' > super_manager.js
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          const LOOP_DURATION = 21000000; // 5 hours 50 minutes
+          const CHECK_INTERVAL = 300000; // Exact 5 Minutes
+          const startMs = Date.now();
+          const currentRunId = process.env.GITHUB_RUN_ID;
+          const stopTimeInput = (process.env.STOP_TIME || '3:00 AM').trim();
+          
+          // Strict Boolean Logic
+          const rawDeleteInput = (process.env.DELETE_KACHRA || 'true').trim().toLowerCase();
+          const deleteKachra = rawDeleteInput === 'true'; 
+
+          function getPktTime(offsetMs = 0) {
+            return new Date(Date.now() + offsetMs).toLocaleString('en-US', { 
+              timeZone: 'Asia/Karachi', 
+              hour12: true, month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' 
+            });
+          }
+
+          console.log('\n==================================================');
+          console.log(`[*] SUPER MANAGER STARTED AT: ${getPktTime()}`);
+          console.log(`[*] TARGET AUTO-STOP TIME: ${stopTimeInput}`);
+          console.log(`[*] AUTO-DELETE KACHRA: ${deleteKachra ? 'TRUE (Enabled)' : 'FALSE (Disabled)'}`);
+          console.log('==================================================');
+
+          async function startLoop() {
+            let loopCount = 1;
+
+            while (Date.now() - startMs < LOOP_DURATION) {
+              try {
+                console.log('\n--------------------------------------------------');
+                console.log(`[⏱️] SYSTEM CHECK ROUND #${loopCount}`);
+                console.log(`[📍] Current Time: ${getPktTime()} (PKT)`);
+                console.log('--------------------------------------------------');
+
+                const nowUtc = new Date();
+                const pktDate = new Date(nowUtc.getTime() + (5 * 60 * 60 * 1000));
+                const pktHours = pktDate.getUTCHours();
+                const pktMinutes = pktDate.getUTCMinutes();
+
+                // =========================================================================
+                // 🛑 AUTO CLEANUP RESET CHECK (Stop Time Logic)
+                // =========================================================================
+                let triggerCleanup = false;
+                if (stopTimeInput.toLowerCase() !== 'none') {
+                  const timeMatch = stopTimeInput.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+                  if (timeMatch) {
+                    let [_, stopHoursStr, stopMinutesStr, stopAmpm] = timeMatch;
+                    let stopHours = parseInt(stopHoursStr);
+                    let stopMinutes = parseInt(stopMinutesStr);
+
+                    if (stopAmpm.toUpperCase() === 'PM' && stopHours < 12) stopHours += 12;
+                    if (stopAmpm.toUpperCase() === 'AM' && stopHours === 12) stopHours = 0;
+
+                    const currentTotalMins = (pktHours * 60) + pktMinutes;
+                    const stopTotalMins = (stopHours * 60) + stopMinutes;
+
+                    let diffMins = currentTotalMins - stopTotalMins;
+                    if (diffMins < 0) diffMins += 24 * 60; 
+
+                    if (diffMins >= 0 && diffMins <= 15) {
+                      triggerCleanup = true;
+                    }
+                  }
+                }
+
+                if (triggerCleanup) {
+                  console.log('\n==================================================');
+                  console.log(`[🛑] TARGET TIME (${stopTimeInput}) REACHED! STARTING SYSTEM SHUTDOWN...\n`);
+                  
+                  let otherRunsPending = true;
+                  let attempts = 0;
+
+                  // Cancellations for other pending streams
+                  while (otherRunsPending && attempts < 6) {
+                    attempts++;
+                    const runsJson = execSync('gh run list --status in_progress --json databaseId,workflowName', { encoding: 'utf8' });
+                    const runs = JSON.parse(runsJson || '[]');
+                    const otherRuns = runs.filter(r => String(r.databaseId) !== String(currentRunId));
+
+                    if (otherRuns.length === 0) {
+                      otherRunsPending = false;
+                      break;
+                    }
+                    for (const r of otherRuns) {
+                      try { execSync(`gh run cancel ${r.databaseId}`, { stdio: 'ignore' }); } catch(e) {}
+                    }
+                    if (otherRunsPending) await new Promise(r => setTimeout(r, 30000));
+                  }
+
+                  // Kachra Deletion Logic
+                  if (deleteKachra) {
+                    console.log('\n[*] Deleting ALL old workflows (Kachra)...');
+                    try {
+                      const kachraJson = execSync('gh run list --limit 1000 --json databaseId', { encoding: 'utf8' });
+                      const kachraRuns = JSON.parse(kachraJson || '[]');
+                      
+                      let delCount = 0;
+                      for (const r of kachraRuns) {
+                        if (String(r.databaseId) !== String(currentRunId)) {
+                          try { 
+                            execSync(`gh api -X DELETE /repos/${process.env.GH_REPO}/actions/runs/${r.databaseId}`, { stdio: 'ignore' }); 
+                            delCount++; 
+                          } catch(e) {}
+                        }
+                      }
+                      console.log(`[+] Safai Mukammal! ${delCount} purane workflows delete ho gaye.`);
+                    } catch(err) {
+                      console.log('[-] Deletion Error:', err.message);
+                    }
+                  }
+
+                  console.log(`[🛑] Manager shutting down cleanly...`);
+                  process.exit(0);
+                }
+
+                // =========================================================================
+                // 🔄 NORMAL MODE: STREAM PULL & CHECKS
+                // =========================================================================
+                execSync('git pull origin main --rebase', { stdio: 'ignore' });
+                
+                // =========================================================================
+                // 🛑 MIDDLE CANCEL LOGIC (Scheduled & Multi-Channel)
+                // =========================================================================
+                if (fs.existsSync('cancel.csv')) {
+                  const cancelData = fs.readFileSync('cancel.csv', 'utf8');
+                  const cLines = cancelData.trim().split('\n');
+                  let cChangesMade = false;
+                  let updatedCancelCsv = [cLines[0]]; // Header
+                  let channelsToCancel = [];
+                  const nowUtcCancel = new Date();
+
+                  for (let i = 1; i < cLines.length; i++) {
+                    if (!cLines[i].trim()) continue;
+                    const parts = cLines[i].split(',').map(s => s.trim());
+                    if (parts.length < 2) { updatedCancelCsv.push(cLines[i]); continue; }
+                    
+                    const [channelName, cancelTimeStr] = parts;
+
+                    if (!cancelTimeStr || cancelTimeStr.toLowerCase() === 'none' || cancelTimeStr.toLowerCase() === 'done') {
+                      updatedCancelCsv.push(cLines[i]);
+                      continue;
+                    }
+
+                    if (cancelTimeStr.toLowerCase() === 'now') {
+                      channelsToCancel.push(channelName);
+                      updatedCancelCsv.push(`${channelName},Done`);
+                      cChangesMade = true;
+                      continue;
+                    }
+
+                    const match = cancelTimeStr.match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(AM|PM)/i);
+                    if (match) {
+                      let [_, datePart, hours, minutes, ampm] = match;
+                      hours = parseInt(hours);
+                      if (ampm.toUpperCase() === 'PM' && hours < 12) hours += 12;
+                      if (ampm.toUpperCase() === 'AM' && hours === 12) hours = 0;
+
+                      const targetDateStr = `${datePart}T${hours.toString().padStart(2, '0')}:${minutes}:00+05:00`;
+                      const targetTime = new Date(targetDateStr);
+                      
+                      const diffMinutesCancel = (targetTime - nowUtcCancel) / (1000 * 60);
+
+                      if (diffMinutesCancel <= 0 && diffMinutesCancel >= -30) { 
+                        channelsToCancel.push(channelName);
+                        updatedCancelCsv.push(`${channelName},Done`);
+                        cChangesMade = true;
+                      } else {
+                        updatedCancelCsv.push(cLines[i]); 
+                      }
+                    } else {
+                      updatedCancelCsv.push(cLines[i]); 
+                    }
+                  }
+
+                  if (channelsToCancel.length > 0) {
+                    console.log(`\n[🚨] MID-STREAM CANCEL TRIGGERED FOR: ${channelsToCancel.join(', ')}`);
+                    try {
+                      const activeRunsJson = execSync('gh run list --status in_progress --json databaseId,name,displayTitle', { encoding: 'utf8' });
+                      const activeRuns = JSON.parse(activeRunsJson || '[]');
+                      
+                      for (const chan of channelsToCancel) {
+                        let found = false;
+                        const cleanChan = chan.replace(/^channel\s*/i, '').trim();
+                        for (const r of activeRuns) {
+                          const title = (r.displayTitle || '').trim();
+                          const name = (r.name || '').trim();
+                          // Exact match for "OK.ru Live - Channel X" so Channel 1 doesn't kill Channel 1.1
+                          if (
+                            title === `OK.ru Live - Channel ${cleanChan}` ||
+                            title.endsWith(`Channel ${cleanChan}`) ||
+                            title === chan ||
+                            name === chan
+                          ) {
+                            console.log(`[-] Killing Run ID: ${r.databaseId} for Channel: ${chan}`);
+                            execSync(`gh run cancel ${r.databaseId}`, { stdio: 'ignore' });
+                            found = true;
+                          }
+                        }
+                        if (!found) console.log(`[!] No active workflow found for ${chan}`);
+                      }
+                    } catch(e) {
+                      console.log('[!] Error cancelling specific streams:', e.message);
+                    }
+                  }
+
+                  if (cChangesMade) {
+                    fs.writeFileSync('cancel.csv', updatedCancelCsv.join('\n') + '\n');
+                    execSync('git add cancel.csv && git commit -m "Bot: Processed Scheduled Cancels" && git push', { stdio: 'ignore' });
+                  }
+                }
+
+                // =========================================================================
+                // 🎬 STREAMS.CSV LOGIC (Compatible with your main.yml)
+                // =========================================================================
+                if (fs.existsSync('streams.csv')) {
+                  const csvData = fs.readFileSync('streams.csv', 'utf8');
+                  const lines = csvData.trim().split('\n');
+                  const header = lines[0];
+                  let updatedCsv = [header];
+                  let changesMade = false;
+                  const nowUtcStreams = new Date();
+
+                  for (let i = 1; i < lines.length; i++) {
+                    if (!lines[i].trim()) continue;
+                    const parts = lines[i].split(',').map(s => s.trim());
+                    if (parts.length < 5) { updatedCsv.push(lines[i]); continue; }
+                    
+                    const url = parts[0];
+                    const channel = parts[1] || '1';
+                    const quality = parts[2] || '720p';
+                    const server = parts[3] || 'None';
+                    const startTimeStr = parts[4];
+                    const duration = parts[5] || '360';
+                    const proxyEngine = parts[6] || 'Cloudflare WARP (Recommended)';
+                    const enableAudio = parts[7] || 'ON';
+
+                    if (!startTimeStr || startTimeStr.toLowerCase() === 'none' || startTimeStr === '') {
+                      updatedCsv.push(lines[i]); continue;
+                    }
+
+                    const match = startTimeStr.match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(AM|PM)/i);
+                    if (match) {
+                      let [_, datePart, hours, minutes, ampm] = match;
+                      hours = parseInt(hours);
+                      if (ampm.toUpperCase() === 'PM' && hours < 12) hours += 12;
+                      if (ampm.toUpperCase() === 'AM' && hours === 12) hours = 0;
+
+                      const targetDateStr = `${datePart}T${hours.toString().padStart(2, '0')}:${minutes}:00+05:00`;
+                      const targetTime = new Date(targetDateStr);
+                      const diffMinutesStream = (targetTime - nowUtcStreams) / (1000 * 60);
+
+                      if (diffMinutesStream <= 20 && diffMinutesStream >= -5) {
+                        const formattedUrls = url.replace(/\|/g, ',');
+                        console.log(`\n[🚀] TRIGGER WINDOW HIT! Starting Channel ${channel}`);
+                        const cmd = `gh workflow run main.yml -f target_urls="${formattedUrls}" -f okru_stream_channel="${channel}" -f stream_quality="${quality}" -f server_selection="${server}" -f proxy_engine="${proxyEngine}" -f enable_stream_audio="${enableAudio}"`;
+                        try {
+                          execSync(cmd, { stdio: 'inherit' });
+                          changesMade = true;
+                        } catch(e) { updatedCsv.push(lines[i]); }
+                      } else if (diffMinutesStream < -5) {
+                        changesMade = true; 
+                      } else {
+                        updatedCsv.push(lines[i]); 
+                      }
+                    } else {
+                      updatedCsv.push(lines[i]);
+                    }
+                  }
+
+                  if (changesMade) {
+                    fs.writeFileSync('streams.csv', updatedCsv.join('\n') + '\n');
+                    execSync('git add streams.csv && git commit -m "Bot: Stream queue updated" && git push', { stdio: 'ignore' });
+                  }
+                }
+
+              } catch(err) {
+                console.log('[!] Loop warning: ' + err.message);
+              }
+
+              console.log(`[*] Check round ${loopCount} completed.`);
+              loopCount++;
+              await new Promise(r => setTimeout(r, CHECK_INTERVAL));
+            }
+
+            console.log('\n==================================================');
+            console.log(`[*] 5h 50m Completed at ${getPktTime()}! Triggering next Stream Manager...`);
+            try {
+              const nextManagerCmd = `gh workflow run stream-manager.yml -f stop_time="${stopTimeInput}" -f delete_kachra="${deleteKachra}"`;
+              execSync(nextManagerCmd, { stdio: 'inherit' });
+              console.log('[+] Handover complete! Shutting down cleanly.');
+            } catch(err) {}
+            process.exit(0);
+          }
+
+          startLoop();
+          EOF
+          
+          node super_manager.js
