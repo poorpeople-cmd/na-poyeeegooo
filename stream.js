@@ -3,6 +3,8 @@
 
 
 
+
+
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -193,18 +195,17 @@ function keepChromeOnTopAndHideOBS() {
 // =========================================================================================
 // 🛡️ POPUP & AD FIREWALL + LOADING UI
 // =========================================================================================
-// =========================================================================================
-// 🛡️ POPUP & AD FIREWALL + LOADING UI (DRM-Safe CDP Ad Blocker)
-// =========================================================================================
 async function setupPageProtections(p) {
     try {
+        // Clean User-Agent & Language headers so HLS CDN never throws 403 Protected Content error
+        await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        await p.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+        // Block ad domains at CDP level WITHOUT intercepting/corrupting HLS .m3u8 & key requests
         const client = await p.target().createCDPSession();
         await client.send('Network.enable');
         await client.send('Network.setBlockedURLs', {
-            urls: [
-                '*popads*', '*exoclick*', '*adsterra*', '*onclickads*',
-                '*doubleclick*', '*adexchangerapid*', '*bet365*', '*1xbet*'
-            ]
+            urls: ['*popads*', '*exoclick*', '*adsterra*', '*onclickads*', '*doubleclick*', '*adexchangerapid*', '*bet365*', '*1xbet*']
         });
 
         await p.evaluateOnNewDocument(() => {
@@ -247,6 +248,8 @@ async function hideLoadingOverlay(p) {
 // =========================================================================================
 // 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Supports Nested Iframes like webcric)
 // =========================================================================================
+let currentPlayerTab = 0;
+
 async function lockAndPlayVideo(p) {
     if (!p) return;
     try {
@@ -258,8 +261,36 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 2000));
         }
 
-        // Click Play / Unmute across all frames
+        // Click Play / Unmute across all frames + Detect "protected content" 403 error
         for (let attempt = 0; attempt < 8; attempt++) {
+            let hasProtectedError = false;
+            for (const frame of p.frames()) {
+                if (frame.isDetached()) continue;
+                try {
+                    const errFound = await frame.evaluate(() => {
+                        const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+                        return txt.includes('protected content') || txt.includes('232403') || txt.includes('cannot be played');
+                    });
+                    if (errFound) { hasProtectedError = true; break; }
+                } catch (e) {}
+            }
+
+            // If Player 1 gives "problem providing access to protected content", click next Player button (Player 2, Player 3...)
+            if (hasProtectedError) {
+                currentPlayerTab++;
+                console.log(`[⚠️] Protected Content (403) Error detected! Switching to backup Player tab #${currentPlayerTab + 1}...`);
+                await p.evaluate((tabIdx) => {
+                    const playerBtns = Array.from(document.querySelectorAll('a, button, li, span, div')).filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return /^Player\s*\d+$/i.test(t) || /^Server\s*\d+$/i.test(t) || /^Stream\s*\d+$/i.test(t);
+                    });
+                    if (playerBtns.length > 0) {
+                        const targetBtn = playerBtns[tabIdx % playerBtns.length];
+                        targetBtn.click();
+                    }
+                }, currentPlayerTab).catch(() => {});
+                await new Promise(r => setTimeout(r, 3500));
+            }
             let playing = false;
             for (const frame of p.frames()) {
                 if (frame.isDetached()) continue;
@@ -306,13 +337,9 @@ async function lockAndPlayVideo(p) {
                     }
 
                     // If this frame only hosts child iframes, maximize the main player iframe
-                    // If this frame only hosts child iframes, allow DRM & maximize the main player iframe
                     const iframes = Array.from(document.querySelectorAll('iframe'));
                     let best = null, maxArea = 5000;
                     iframes.forEach(f => {
-                        if (!f.allow || !f.allow.includes('encrypted-media')) {
-                            f.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
-                        }
                         const area = f.clientWidth * f.clientHeight;
                         if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
                     });
@@ -413,6 +440,10 @@ async function startWatchdog() {
         } else {
             deadStrikes++;
             console.log(`[⚠️] Stream Unhealthy (${health.status}) - Strike ${deadStrikes}/5`);
+            // Re-run lockAndPlayVideo on Strike 2 & 3 so it can auto-switch Player 1 -> Player 2 -> Player 3 before giving up
+            if (deadStrikes === 2 || deadStrikes === 3) {
+                await lockAndPlayVideo(page);
+            }
             if (deadStrikes >= 5) {
                 deadStrikes = 0;
                 currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
@@ -475,8 +506,7 @@ async function startEngine() {
         '--no-sandbox', '--disable-setuid-sandbox', `--window-size=${RES_W},${RES_H}`,
         '--window-position=0,0', '--kiosk', '--start-fullscreen',
         '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--enable-widevine', '--allow-running-insecure-content'
+        '--disable-blink-features=AutomationControlled', '--use-gl=egl'
     ];
 
     if (PROXY_ENGINE.includes('Cloudflare')) args.push('--proxy-server=socks5://127.0.0.1:40000');
@@ -488,16 +518,10 @@ async function startEngine() {
         console.log('[🛡️] uBlock Origin Lite MV3 Extension Loaded!');
     }
 
-    // Use Official Google Chrome on Linux so Widevine DRM works for protected streams
-    const chromePaths = ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'];
-    const executablePath = chromePaths.find(p => fs.existsSync(p));
-    if (executablePath) console.log(`[🌐] Using DRM-Enabled Chrome: ${executablePath}`);
-
     browser = await puppeteer.launch({
         headless: false,
-        executablePath: executablePath || undefined,
         defaultViewport: { width: RES_W, height: RES_H },
-        ignoreDefaultArgs: ['--enable-automation', '--disable-component-update'],
+        ignoreDefaultArgs: ['--enable-automation'],
         args
     });
 
@@ -543,14 +567,6 @@ setTimeout(() => {
         }
     }
 })();
-
-
-
-
-
-
-
-
 
 
 
