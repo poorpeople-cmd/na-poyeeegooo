@@ -1,11 +1,3 @@
-
-
-
-
-
-
-
-
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -132,7 +124,7 @@ console.log(`[🚀] Engine Locked: ${RES_W}x${RES_H} @ ${BITRATE}kbps | Channel:
 console.log(`[📋] Loaded ${urlList.length} URLs for Failover:`, urlList);
 
 // =========================================================================================
-// 🎥 OBS CONFIGURATION (With OBS 30+ WebSocket Plugin Fix)
+// 🎥 OBS CONFIGURATION (With OBS 30+ WebSocket Plugin & SimpleOutput Sync Fix)
 // =========================================================================================
 function setupOBSConfig() {
     const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
@@ -156,7 +148,8 @@ function setupOBSConfig() {
         server_port: 4455
     }, null, 2));
 
-    fs.writeFileSync(path.join(profilesDir, 'basic.ini'), `[General]\nName=Untitled\n[Video]\nBaseCX=${RES_W}\nBaseCY=${RES_H}\nOutputCX=${RES_W}\nOutputCY=${RES_H}\nFPSCommon=30\n[Output]\nMode=Advanced\n[AdvOut]\nTrackIndex=1\nRecType=Standard\nEncoder=obs_x264\n[obs_x264]\nbitrate=${BITRATE}\nkeyint_sec=2\npreset=ultrafast\nprofile=main\ntune=zerolatency\n`);
+    // SimpleOutput ensures x264 ultrafast + zerolatency + rc-lookahead=0 apply directly from basic.ini
+    fs.writeFileSync(path.join(profilesDir, 'basic.ini'), `[General]\nName=Untitled\n[Video]\nBaseCX=${RES_W}\nBaseCY=${RES_H}\nOutputCX=${RES_W}\nOutputCY=${RES_H}\nFPSCommon=30\n[Output]\nMode=Simple\n[SimpleOutput]\nVBitrate=${BITRATE}\nStreamEncoder=x264\nx264Preset=ultrafast\nx264Settings=keyint=60 tune=zerolatency profile=main threads=4 rc-lookahead=0\n`);
 
     const serviceJson = {
         settings: { server: "rtmp://vsu.okcdn.ru/input/", key: ACTIVE_STREAM_KEY.trim() },
@@ -164,7 +157,6 @@ function setupOBSConfig() {
     };
     fs.writeFileSync(path.join(profilesDir, 'service.json'), JSON.stringify(serviceJson, null, 2));
 
-    // MainScene set as default so video + audio broadcast even if WebSocket is delayed
     const sceneJson = {
         current_scene: "MainScene",
         current_program_scene: "MainScene",
@@ -172,7 +164,7 @@ function setupOBSConfig() {
         scene_order: [{ name: "WaitingScene" }, { name: "MainScene" }],
         sources: [
             { id: "xshm_input", name: "Screen", settings: { show_cursor: false } },
-            { id: "pulse_output_capture", name: "Audio", settings: {} },
+            { id: "pulse_output_capture", name: "Audio", settings: { device_id: "default", use_device_timing: false } },
             { id: "scene", name: "MainScene", settings: { items: [{ name: "Screen", id: 1, visible: true }, { name: "Audio", id: 2, visible: true }] } },
             { id: "scene", name: "WaitingScene", settings: { items: [{ name: "Screen", id: 1, visible: true }] } }
         ]
@@ -181,21 +173,14 @@ function setupOBSConfig() {
 }
 
 // =========================================================================================
-// 🪟 HIDE OBS WINDOW & FORCE CHROME ON TOP (X11 / Xvfb Fix)
+// 🪟 HIDE OBS WINDOW (Without Resizing Chrome Every 2 Seconds)
 // =========================================================================================
 function keepChromeOnTopAndHideOBS() {
     try {
-        // Move OBS window far off-screen and minimize it so it never appears on stream
         execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
-        // Force Chrome window to 0,0 with full resolution and bring to front
-        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
-        execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
     } catch (e) {}
 }
 
-// =========================================================================================
-// 🛡️ POPUP & AD FIREWALL + LOADING UI
-// =========================================================================================
 // =========================================================================================
 // 🛡️ POPUP & AD FIREWALL + LOADING UI (DRM-Safe CDP + Windows 11 Anti-Detect Spoof)
 // =========================================================================================
@@ -205,7 +190,8 @@ const AD_BLOCK_PATTERNS = [
     '*propellerads*', '*hilltopads*', '*trafficjunky*', '*juicyads*', '*clickadu*',
     '*adcash*', '*galaksion*', '*bidvertiser*', '*revcontent*', '*mgid*',
     '*taboola*', '*outbrain*', '*acscdn*', '*histats*', '*usrpubtrk*',
-    '*clarity.ms*', '*yandex.ru/metrika*', '*adsco.re*', '*a-ads.com*', '*bidgear*'
+    '*clarity.ms*', '*yandex.ru/metrika*', '*adsco.re*', '*a-ads.com*', '*bidgear*',
+    '*jerkmate*', '*fanduel*', '*adrevenue*'
 ];
 
 async function attachCdpAdBlocker(target) {
@@ -218,10 +204,9 @@ async function attachCdpAdBlocker(target) {
 
 async function setupPageProtections(p) {
     try {
-        // 1. Native CDP Ad-Blocker (Does NOT touch or corrupt JW Player DRM/HLS token headers)
         await attachCdpAdBlocker(p.target());
+        p.on('dialog', async dialog => { try { await dialog.dismiss(); } catch (e) {} });
 
-        // 2. Spoof Windows 11 + NVIDIA GPU so Backend CDN doesn't block Linux GitHub Runner
         await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
 
         await p.evaluateOnNewDocument(() => {
@@ -230,19 +215,31 @@ async function setupPageProtections(p) {
             window.confirm = () => true;
             window.prompt = () => null;
 
-            // Hide Linux & Headless indicators from Player Anti-Bot scripts
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
 
-            // Spoof WebGL Renderer (Hides Google SwiftShader / Virtual Xvfb GPU)
             const getParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(param) {
                 if (param === 37445) return 'Google Inc. (NVIDIA)';
                 if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
                 return getParameter.apply(this, arguments);
             };
+
+            // Shadow DOM Ad Destroyer
+            const originalAttachShadow = Element.prototype.attachShadow;
+            Element.prototype.attachShadow = function(init) {
+                if (init && init.mode === 'closed') init.mode = 'open';
+                const shadowRoot = originalAttachShadow.call(this, init);
+                const observer = new MutationObserver(() => {
+                    const adElements = shadowRoot.querySelectorAll('in-page-message, [id^="note-"], [id^="missclick-"], [id^="close-"], [src*="adexchangerapid"]');
+                    if (adElements.length > 0) { this.remove(); }
+                });
+                observer.observe(shadowRoot, { childList: true, subtree: true });
+                return shadowRoot;
+            };
+            Element.prototype.attachShadow.toString = function() { return "function attachShadow() { [native code] }"; };
 
             // Inject encrypted-media permission into every iframe BEFORE it loads
             const drmAllow = 'autoplay; encrypted-media; fullscreen; picture-in-picture; clipboard-write';
@@ -266,7 +263,7 @@ async function setupPageProtections(p) {
             obs.observe(document, { childList: true, subtree: true });
 
             const style = document.createElement('style');
-            style.textContent = `html, body { background-color: #000 !important; overflow: hidden !important; margin: 0 !important; }`;
+            style.textContent = `html, body { background-color: #000 !important; overflow: hidden !important; margin: 0 !important; } in-page-message, [id^="note-"], [id^="missclick-"], [id^="close-"] { display: none !important; opacity: 0 !important; pointer-events: none !important; }`;
             if (document.documentElement) document.documentElement.appendChild(style);
         });
     } catch (e) {}
@@ -298,9 +295,69 @@ async function hideLoadingOverlay(p) {
 }
 
 // =========================================================================================
-// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Supports Nested Iframes like webcric)
+// 🎬 VIDEO PLAYER AUTO-PLAY & FULLSCREEN LOCK (Reference Code Clean Maintainer)
 // =========================================================================================
 let currentPlayerTab = 0;
+
+async function forcePlayerFullscreen(p) {
+    if (!p) return;
+    try {
+        for (const frame of p.frames()) {
+            if (frame.isDetached()) continue;
+            await frame.evaluate(() => {
+                const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+                if (txt.includes('protected content') || txt.includes('232403')) return;
+
+                document.documentElement.style.setProperty('background-color', '#000', 'important');
+                if (document.body) {
+                    document.body.style.setProperty('background-color', '#000', 'important');
+                    document.body.style.setProperty('overflow', 'hidden', 'important');
+                }
+
+                const videos = Array.from(document.querySelectorAll('video'));
+                const realVideo = videos.find(v => v.clientWidth > 50 || !v.paused);
+                if (realVideo) {
+                    const wrap = realVideo.closest('.jwplayer, #player, .plyr, .vjs-player, .shaka-video-container, [data-player], .player-poster') || realVideo;
+                    wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;display:block !important;visibility:visible !important;opacity:1 !important;';
+                    realVideo.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483647 !important;background:#000 !important;object-fit:contain !important;pointer-events:none !important;';
+
+                    document.querySelectorAll('body *').forEach(el => {
+                        if (el === realVideo || el.contains(realVideo) || el.id === 'bot-loading-ui' || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('visibility', 'hidden', 'important');
+                        el.style.setProperty('opacity', '0', 'important');
+                    });
+                    return;
+                }
+
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                let mainIframe = null, maxScore = -1;
+                iframes.forEach(ifr => {
+                    const src = (ifr.src || '').toLowerCase();
+                    if (/popads|exoclick|adsterra|doubleclick|bet365|1xbet|juicyads|clickadu|propeller/i.test(src)) {
+                        ifr.remove();
+                        return;
+                    }
+                    const w = ifr.clientWidth, h = ifr.clientHeight;
+                    const area = w * h;
+                    if (area < 5000 || h > w) return;
+                    let score = area + ((ifr.hasAttribute('allowfullscreen') || ifr.hasAttribute('webkitallowfullscreen')) ? 10000000 : 0);
+                    if (score > maxScore) { maxScore = score; mainIframe = ifr; }
+                });
+
+                if (mainIframe) {
+                    mainIframe.style.cssText = 'position:fixed !important;top:0px !important;left:0px !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;background:#000 !important;border:none !important;opacity:1 !important;display:block !important;visibility:visible !important;';
+                    document.querySelectorAll('body *').forEach(el => {
+                        if (el === mainIframe || el.contains(mainIframe) || el.id === 'bot-loading-ui' || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
+                        el.style.setProperty('opacity', '0', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                        el.style.setProperty('z-index', '-9999', 'important');
+                    });
+                }
+            }).catch(() => {});
+        }
+    } catch (e) {}
+}
 
 async function lockAndPlayVideo(p) {
     if (!p) return;
@@ -313,15 +370,14 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 2000));
         }
 
-        // Click Play / Unmute across all frames + Instant Switch on "Protected Content" (403)
-        for (let attempt = 0; attempt < 10; attempt++) {
+        for (let attempt = 0; attempt < 12; attempt++) {
             let hasProtectedError = false;
             for (const frame of p.frames()) {
                 if (frame.isDetached()) continue;
                 try {
                     const errFound = await frame.evaluate(() => {
                         const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
-                        return txt.includes('protected content') || txt.includes('232403') || txt.includes('cannot be played') || txt.includes('error code');
+                        return txt.includes('protected content') || txt.includes('232403') || txt.includes('playback error') || txt.includes('error loading media');
                     });
                     if (errFound) { hasProtectedError = true; break; }
                 } catch (e) {}
@@ -329,24 +385,21 @@ async function lockAndPlayVideo(p) {
 
             if (hasProtectedError) {
                 currentPlayerTab++;
-                // Un-lock fullscreen iframe on main page FIRST so clicking the next Player button actually swaps the iframe!
                 await p.evaluate((tabIdx) => {
                     document.querySelectorAll('iframe').forEach(f => {
                         f.style.cssText = 'width:100%;height:500px;position:relative;z-index:1;display:block;visibility:visible;';
                     });
-                    // Find unique clickable Player / Server / Stream buttons or links
-                    const allEls = Array.from(document.querySelectorAll('a, button, .btn, [onclick], [data-stream], [data-server], li'));
+                    const allEls = Array.from(document.querySelectorAll('a, button, .btn, [onclick], [data-stream], [data-server], li, span'));
                     const playerBtns = allEls.filter(el => {
-                        if (el.children.length > 1) return false; // Avoid parent wrapper divs
+                        if (el.children.length > 1) return false;
                         const t = (el.innerText || '').trim();
-                        return /^(Player|Server|Stream|Channel|Link|HD|Backup|Mirror)\s*\d*$/i.test(t) || /player|stream|embed|watch/i.test(el.getAttribute('href') || '') || el.hasAttribute('onclick');
+                        return /^(Player|Server|Stream|Channel|Link|HD|Backup|Mirror|Cast)\s*\d*$/i.test(t) || /player|stream|embed|watch/i.test(el.getAttribute('href') || '') || el.hasAttribute('onclick');
                     });
-                    if (playerBtns.length > 0) {
-                        const targetBtn = playerBtns[tabIdx % playerBtns.length];
-                        targetBtn.click();
+                    if (playerBtns.length > 1) {
+                        playerBtns[tabIdx % playerBtns.length].click();
                     }
                 }, currentPlayerTab).catch(() => {});
-                console.log(`[⚡] Protected Content (403) -> Switched immediately to Player option #${currentPlayerTab + 1}`);
+                console.log(`[⚡] Protected Content (403) -> Switched to Player option #${currentPlayerTab + 1}`);
                 await new Promise(r => setTimeout(r, 3500));
             }
 
@@ -356,38 +409,16 @@ async function lockAndPlayVideo(p) {
                 try {
                     const status = await frame.evaluate((audioEnabled) => {
                         let isPlaying = false;
-                        const videos = document.querySelectorAll('video');
-
-                        videos.forEach(v => {
-                            // Unmute & set volume without clicking the video element
+                        document.querySelectorAll('video').forEach(v => {
                             v.muted = !audioEnabled;
                             v.volume = audioEnabled ? 1.0 : 0.0;
-
-                            // ONLY call v.play() if it is actually paused! Never click <video> or .clappr-player
-                            if (v.paused) {
-                                v.play().catch(() => {});
-                            }
-                            if (!v.paused && v.readyState >= 2) {
-                                isPlaying = true;
-                            }
+                            if (v.paused) v.play().catch(() => {});
+                            if (!v.paused && v.readyState >= 2 && v.currentTime > 0) isPlaying = true;
                         });
-
-                        // ONLY click play overlays if NO video is playing yet
                         if (!isPlaying) {
-                            const playSelectors = '.jw-display-icon-display, button[data-plyr="play"], .vjs-big-play-button, .player-poster[class*="clickable"]';
+                            const playSelectors = '.jw-display-icon-display, .jw-icon-display[aria-label="Play"], button[data-plyr="play"], .vjs-big-play-button, .fp-play, .player-poster[class*="clickable"]';
                             document.querySelectorAll(playSelectors).forEach(el => { try { el.click(); } catch(e){} });
                         }
-
-                        // Click dedicated unmute buttons ONLY if they exist
-                        if (audioEnabled) {
-                            document.querySelectorAll('[class*="unmute"], .jw-icon-volume').forEach(el => {
-                                const txt = (el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
-                                if (txt.includes('unmute') || el.className.includes('unmute')) {
-                                    try { el.click(); } catch(e){}
-                                }
-                            });
-                        }
-
                         return isPlaying;
                     }, ENABLE_STREAM_AUDIO);
                     if (status) { playing = true; break; }
@@ -397,62 +428,39 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 1500));
         }
 
-        // Stretch largest iframe OR video ONLY when no "protected content" error is on screen
+        await forcePlayerFullscreen(p);
+
         for (const frame of p.frames()) {
             if (frame.isDetached()) continue;
             await frame.evaluate((audioEnabled) => {
-                if (window.__frameLockActive) return;
-                window.__frameLockActive = true;
+                if (window.__LockIntervalSet) return;
+                window.__LockIntervalSet = true;
                 setInterval(() => {
-                    const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
-                    if (txt.includes('protected content') || txt.includes('232403')) return; // Do NOT lock broken error frame!
+                    try {
+                        const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+                        if (txt.includes('protected content') || txt.includes('232403')) return;
 
-                    document.documentElement.style.setProperty('background', '#000', 'important');
-                    if (document.body) document.body.style.setProperty('background', '#000', 'important');
-
-                    const v = document.querySelector('video');
-                    if (v && (v.clientWidth > 50 || !v.paused)) {
-                        // Crucial Fix: If anything pauses the video, immediately resume it via JS API!
-                        if (v.paused) v.play().catch(() => {});
-                        v.muted = !audioEnabled;
-                        v.volume = audioEnabled ? 1.0 : 0.0;
-                        const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player], .player-poster') || v;
-                        wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
-                        v.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483647 !important;background:#000 !important;object-fit:contain !important;pointer-events:none !important;';
-
-                        // Nuke every overlay ad, banner, iframe, or fake close button inside the video frame
-                        document.querySelectorAll('body *').forEach(el => {
-                            if (el === v || el.contains(v) || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
-                            el.style.setProperty('display', 'none', 'important');
-                            el.style.setProperty('visibility', 'hidden', 'important');
-                            el.style.setProperty('opacity', '0', 'important');
+                        document.querySelectorAll('video, audio').forEach(media => {
+                            if (media.paused && media.tagName === 'VIDEO') media.play().catch(() => {});
+                            media.muted = !audioEnabled;
+                            media.volume = audioEnabled ? 1.0 : 0.0;
                         });
-                        return;
-                    }
 
-                    // Maximize active player iframe & hide all surrounding page ads/banners
-                    const iframes = Array.from(document.querySelectorAll('iframe'));
-                    let best = null, maxArea = 5000;
-                    iframes.forEach(f => {
-                        const src = (f.src || '').toLowerCase();
-                        if (/popads|exoclick|adsterra|doubleclick|bet365|1xbet|juicyads|clickadu|propeller/i.test(src)) {
-                            f.remove();
-                            return;
+                        const videos = Array.from(document.querySelectorAll('video'));
+                        const realVideo = videos.find(v => v.clientWidth > 50 || !v.paused);
+                        if (realVideo) {
+                            const wrap = realVideo.closest('.jwplayer, #player, .plyr, .vjs-player, .shaka-video-container, [data-player], .player-poster') || realVideo;
+                            wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
+                            realVideo.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483647 !important;background:#000 !important;object-fit:contain !important;pointer-events:none !important;';
+                            document.querySelectorAll('body *').forEach(el => {
+                                if (el === realVideo || el.contains(realVideo) || el.id === 'bot-loading-ui' || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
+                                el.style.setProperty('display', 'none', 'important');
+                                el.style.setProperty('visibility', 'hidden', 'important');
+                                el.style.setProperty('opacity', '0', 'important');
+                            });
                         }
-                        const area = f.clientWidth * f.clientHeight;
-                        if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
-                    });
-                    if (best) {
-                        best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;border:none !important;background:#000 !important;display:block !important;visibility:visible !important;';
-                        // Hide floating page ads/overlays while keeping player switcher buttons clickable in DOM
-                        document.querySelectorAll('body *').forEach(el => {
-                            if (el === best || el.contains(best) || el.id === 'bot-loading-ui' || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
-                            el.style.setProperty('opacity', '0', 'important');
-                            el.style.setProperty('pointer-events', 'none', 'important');
-                            el.style.setProperty('z-index', '-9999', 'important');
-                        });
-                    }
-                }, 1000);
+                    } catch (err) {}
+                }, 800);
             }, ENABLE_STREAM_AUDIO).catch(() => {});
         }
     } catch (e) {}
@@ -460,9 +468,6 @@ async function lockAndPlayVideo(p) {
 
 // =========================================================================================
 // 💓 HEALTH CHECK & WATCHDOG
-// =========================================================================================
-// =========================================================================================
-// 💓 HEALTH CHECK & WATCHDOG (With Real Network Segment Verification)
 // =========================================================================================
 async function checkStreamHealth(p) {
     if (!p) return { status: 'DEAD' };
@@ -473,68 +478,29 @@ async function checkStreamHealth(p) {
                 return await Promise.race([
                     frame.evaluate(() => {
                         const txt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
-                        if (txt.includes('protected content') || txt.includes('232403')) return null;
-
-                        // Track unique media segments in network to distinguish NEW data vs LOOPING old data
-                        if (!window.__seenSegments) {
-                            window.__seenSegments = new Set();
-                            window.__lastNewSegTime = Date.now();
-                            window.__uniqueSegCount = 0;
+                        if (txt.includes('protected content') || txt.includes('232403') || txt.includes('stream error') || txt.includes('stream unavailable')) {
+                            return { status: 'CRITICAL_ERROR' };
                         }
-
-                        try {
-                            const entries = performance.getEntriesByType('resource');
-                            performance.clearResourceTimings();
-                            for (const e of entries) {
-                                const u = e.name || '';
-                                // Ignore manifest polls (.m3u8/.mpd) because stuck players still poll manifests
-                                if (/\.(m3u8|mpd)(\?|$)/i.test(u)) continue;
-                                const isMediaChunk = (
-                                    e.initiatorType === 'xmlhttprequest' ||
-                                    e.initiatorType === 'fetch' ||
-                                    e.initiatorType === 'media' ||
-                                    /\.(ts|m4s|mp4|aac|cmfv|cmfa)(\?|$)/i.test(u)
-                                );
-                                if (isMediaChunk && !window.__seenSegments.has(u)) {
-                                    window.__seenSegments.add(u);
-                                    if (window.__seenSegments.size > 300) {
-                                        const oldest = window.__seenSegments.values().next().value;
-                                        window.__seenSegments.delete(oldest);
-                                    }
-                                    window.__lastNewSegTime = Date.now();
-                                    window.__uniqueSegCount++;
-                                }
-                            }
-                        } catch (err) {}
-
                         const videos = Array.from(document.querySelectorAll('video'));
                         for (const v of videos) {
                             if (!v.paused && v.readyState >= 2 && v.currentTime > 0) {
-                                v.loop = false;
                                 const frames = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : (v.webkitDecodedFrameCount || 0);
-                                const staleSegMs = window.__uniqueSegCount > 0 ? (Date.now() - window.__lastNewSegTime) : 0;
-                                return {
-                                    status: 'HEALTHY',
-                                    currentTime: v.currentTime,
-                                    frames,
-                                    staleSegMs,
-                                    uniqueSegs: window.__uniqueSegCount
-                                };
+                                return { status: 'HEALTHY', currentTime: v.currentTime, frames };
                             }
                         }
                         return null;
                     }),
-                    new Promise(r => setTimeout(() => r(null), 1500))
+                    new Promise(r => setTimeout(() => r(null), 2000))
                 ]);
             } catch (e) { return null; }
         });
         const results = await Promise.all(checks);
-        // Pick the video with the highest decoded frame count so dummy/ad videos never cause a false freeze!
         const healthyList = results.filter(r => r && r.status === 'HEALTHY');
         if (healthyList.length > 0) {
             healthyList.sort((a, b) => (b.frames || 0) - (a.frames || 0));
             return healthyList[0];
         }
+        if (results.some(r => r && r.status === 'CRITICAL_ERROR')) return { status: 'CRITICAL_ERROR' };
         return { status: 'LOADING_OR_DEAD' };
     } catch (e) {
         return { status: 'DEAD' };
@@ -542,6 +508,7 @@ async function checkStreamHealth(p) {
 }
 
 async function loadCurrentUrl(reason) {
+    currentPlayerTab = 0;
     const targetUrl = urlList[currentUrlIndex];
     console.log(`\n[🔄] ${reason} -> Loading URL [${currentUrlIndex + 1}/${urlList.length}]: ${targetUrl}`);
 
@@ -551,7 +518,7 @@ async function loadCurrentUrl(reason) {
         await page.bringToFront();
         keepChromeOnTopAndHideOBS();
         await showLoadingOverlay(page, "CONNECTING STREAM", `Server ${currentUrlIndex + 1} of ${urlList.length}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await showLoadingOverlay(page, "OPTIMIZING PLAYER", "Locking fullscreen video...");
         await lockAndPlayVideo(page);
         await hideLoadingOverlay(page);
@@ -576,66 +543,33 @@ async function startWatchdog() {
 
         if (health.status === 'HEALTHY') {
             deadStrikes = 0;
-            const isFrozen = (lastTime !== -1 && health.currentTime === lastTime && health.frames === lastFrames);
-            const jumpedBackward = (lastTime !== -1 && health.currentTime < lastTime - 0.5);
+            const isStuck = (lastTime !== -1 && health.currentTime === lastTime && health.frames === lastFrames);
 
-            // True ONLY when an HLS stream stops receiving ANY new unique segments for 28+ seconds (repeating old segments)
-            const isRepeatingOldData = (health.uniqueSegs > 3 && health.staleSegMs > 28000);
-
-            if (jumpedBackward) {
-                if (health.staleSegMs < 8000) {
-                    // Case 1: Time reset to 12s, but NEW segments are actively arriving -> Healthy stream, do NOT touch!
-                    console.log(`[ℹ️] Timeline Reset (${lastTime.toFixed(1)}s -> ${health.currentTime.toFixed(1)}s) with FRESH data (New chunk ${(health.staleSegMs / 1000).toFixed(1)}s ago) -> Stream OK!`);
-                } else {
-                    // Case 2: Time jumped backward AND no new segment arrived -> Try jumping to live buffer edge
-                    console.log(`[🔁] Loop Jump with OLD data (${lastTime.toFixed(1)}s -> ${health.currentTime.toFixed(1)}s | No new chunk for ${(health.staleSegMs / 1000).toFixed(1)}s) -> Seeking live edge...`);
-                    for (const frame of page.frames()) {
-                        if (!frame.isDetached()) {
-                            await frame.evaluate(() => {
-                                document.querySelectorAll('video').forEach(v => {
-                                    v.loop = false;
-                                    if (v.buffered && v.buffered.length > 0) {
-                                        const liveEdge = v.buffered.end(v.buffered.length - 1);
-                                        if (liveEdge - v.currentTime > 2.5) {
-                                            v.currentTime = Math.max(0, liveEdge - 1.0);
-                                        }
-                                    }
-                                });
-                            }).catch(() => {});
-                        }
-                    }
-                }
-            }
-
-            if (isFrozen || isRepeatingOldData) {
-                if (isRepeatingOldData || (Date.now() - freezeStart > 18000)) {
-                    const reason = isRepeatingOldData
-                        ? `LOOPING OLD DATA (No new segment for ${Math.round(health.staleSegMs / 1000)}s)`
-                        : 'VIDEO FROZEN (18s)';
+            if (isStuck) {
+                if (Date.now() - freezeStart > 18000) {
                     currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-                    await loadCurrentUrl(reason);
-                    freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                    await loadCurrentUrl('VIDEO FROZEN (18s)');
+                    freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
                 }
             } else {
                 lastTime = health.currentTime;
                 lastFrames = health.frames;
                 freezeStart = Date.now();
                 await hideLoadingOverlay(page);
+                await forcePlayerFullscreen(page);
             }
 
             const isExempt = NO_REFRESH_DOMAINS.some(d => currentUrl.includes(d));
             if (!isExempt && (Date.now() - urlStart > FORCE_REFRESH_MS)) {
-                await loadCurrentUrl('SCHEDULED 9-MIN REFRESH');
-                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                await loadCurrentUrl('SCHEDULED REFRESH');
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
             }
         } else {
             deadStrikes++;
             console.log(`[⚠️] Stream Unhealthy (${health.status}) - Strike ${deadStrikes}/12`);
-            if (deadStrikes === 4 || deadStrikes === 8) {
-                console.log(`[🔧] Strike ${deadStrikes} recovery -> Checking player tabs & play buttons...`);
+            if (health.status === 'CRITICAL_ERROR' || deadStrikes === 6) {
                 await lockAndPlayVideo(page);
             } else {
-                // Gently force video.play() across all frames without re-clicking the player UI
                 for (const frame of page.frames()) {
                     if (!frame.isDetached()) {
                         await frame.evaluate(() => {
@@ -648,14 +582,13 @@ async function startWatchdog() {
                 deadStrikes = 0;
                 currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
                 await loadCurrentUrl('12 STRIKES -> FAILOVER NEXT URL');
-                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
             }
         }
 
         ticks++;
-        if (ticks === 1 || ticks % 90 === 0) {
-            const segInfo = health.staleSegMs !== undefined ? `${(health.staleSegMs / 1000).toFixed(1)}s ago` : 'N/A';
-            console.log(`[💓] HEARTBEAT | Status: ${health.status} | Time: ${health.currentTime ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Frames: ${health.frames ?? 'N/A'} | Last New Chunk: ${segInfo} | Active URL [${currentUrlIndex + 1}/${urlList.length}]`);
+        if (ticks === 1 || ticks % 45 === 0) {
+            console.log(`[💓] HEARTBEAT | Status: ${health.status} | Time: ${health.currentTime ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Frames: ${health.frames ?? 'N/A'} | Active URL [${currentUrlIndex + 1}/${urlList.length}]`);
         }
 
         await new Promise(r => setTimeout(r, 2000));
@@ -671,7 +604,6 @@ async function startEngine() {
 
     obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray', '--disable-updater']);
 
-    // Restored OBS Console Logs so you can verify RTMP streaming in GitHub Actions
     obsProcess.stdout.on('data', (data) => {
         const line = data.toString().trim();
         if (line.includes('rtmp') || line.includes('stream') || line.includes('Websocket') || line.includes('output')) {
@@ -686,6 +618,7 @@ async function startEngine() {
     });
 
     await new Promise(r => setTimeout(r, 6000));
+    keepChromeOnTopAndHideOBS();
 
     let obsConnected = false;
     for (let i = 0; i < 12; i++) {
@@ -703,8 +636,8 @@ async function startEngine() {
         try { await obs.call('StartStream'); } catch (e) {}
     }
 
-    // 1. Pre-seed Chrome Profile with Widevine CDM so Linux Chrome enables DRM on First Boot
-    const userDataDir = path.join(os.tmpdir(), 'chrome-drm-profile');
+    // 1. Pre-seed Fresh Chrome Profile with Widevine CDM (Fresh Date.now() prevents stale cached segments!)
+    const userDataDir = path.join(os.tmpdir(), `chrome-drm-profile-${Date.now()}`);
     const widevineHintDir = path.join(userDataDir, 'WidevineCdm');
     const defaultProfileDir = path.join(userDataDir, 'Default');
     fs.mkdirSync(widevineHintDir, { recursive: true });
@@ -733,17 +666,22 @@ async function startEngine() {
         '--no-sandbox', '--disable-setuid-sandbox', `--window-size=${RES_W},${RES_H}`,
         '--window-position=0,0', '--kiosk', '--start-fullscreen',
         '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage',
+        '--ignore-certificate-errors', '--disable-smooth-scrolling',
         '--disable-blink-features=AutomationControlled',
         '--enable-widevine',
         '--enable-features=EncryptedMedia,Widevine',
-        '--disable-features=PermissionsPolicyHeader,WebRtcHideLocalIpsWithMdns,DisableLoadExtensionCommandLineSwitch',
+        '--disable-features=PermissionsPolicyHeader,WebRtcHideLocalIpsWithMdns,DisableLoadExtensionCommandLineSwitch,Translate,CalculateNativeWinOcclusion',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-        '--enforce-webrtc-ip-permission-check'
+        '--enforce-webrtc-ip-permission-check',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--alsa-output-device=default',
+        '--allow-running-insecure-content'
     ];
 
     if (PROXY_ENGINE.includes('Cloudflare')) args.push('--proxy-server=socks5://127.0.0.1:40000');
 
-    // Load uBlock WITHOUT --disable-extensions-except (which kills Chrome's internal Widevine component)
     const ublockPath = path.join(process.cwd(), 'ublock-lite');
     if (fs.existsSync(path.join(ublockPath, 'manifest.json'))) {
         args.push(`--load-extension=${ublockPath}`);
@@ -771,7 +709,7 @@ async function startEngine() {
 
     page = (await browser.pages())[0];
 
-   browser.on('targetcreated', async (target) => {
+    browser.on('targetcreated', async (target) => {
         const tType = target.type();
         if (tType === 'page') {
             const newPage = await target.page().catch(() => null);
@@ -779,7 +717,6 @@ async function startEngine() {
                 setTimeout(() => newPage.close().catch(() => {}), 150);
             }
         } else if (tType === 'other' || tType === 'iframe') {
-            // Apply CDP Ad-Blocker to every nested cross-origin player iframe!
             await attachCdpAdBlocker(target);
         }
     });
@@ -849,10 +786,6 @@ if (totalDurationMs <= MAX_RUNNER_MS) {
         }
     }
 })();
-
-
-
-
 
 
 
