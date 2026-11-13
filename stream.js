@@ -526,28 +526,21 @@ async function startWatchdog() {
 
         if (health.status === 'HEALTHY') {
             deadStrikes = 0;
+            
             // 1. Check if video is perfectly frozen
-const isStuck = (lastTime !== -1 && health.currentTime === lastTime && health.frames === lastFrames);
+            const isStuck = (lastTime !== -1 && health.currentTime === lastTime && health.frames === lastFrames);
 
-// 2. NEW: Check if video is looping (Current Time wapas peeche chala gaya)
-let isLooping = false;
-if (lastTime !== -1 && health.currentTime < lastTime && (lastTime - health.currentTime > 3)) {
-    isLooping = true;
-    console.log(`[⚠️] DVR/Loop Trap Detected! Time jumped backwards from ${lastTime.toFixed(1)}s to ${health.currentTime.toFixed(1)}s`);
-}
+            // 2. Check if video is looping (DVR Trap)
+            let isLooping = false;
+            if (lastTime !== -1 && health.currentTime < lastTime && (lastTime - health.currentTime > 3)) {
+                isLooping = true;
+                console.log(`[⚠️] DVR/Loop Trap Detected! Time jumped backwards from ${lastTime.toFixed(1)}s to ${health.currentTime.toFixed(1)}s`);
+            }
 
-// Agar video ruki hui hai YA loop ho rahi hai
-if (isStuck || isLooping) {
-    // Agar video loop ho rahi hai toh 18 seconds ka wait nahi karna, foran naya URL load karo
-    if (isLooping || (Date.now() - freezeStart > 18000)) {
-        currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-        await loadCurrentUrl(isLooping ? 'VIDEO LOOPING (FAILOVER)' : 'VIDEO FROZEN (18s)');
-        freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
-    }
-} else {
-                if (Date.now() - freezeStart > 18000) {
+            if (isStuck || isLooping) {
+                if (isLooping || (Date.now() - freezeStart > 18000)) {
                     currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-                    await loadCurrentUrl('VIDEO FROZEN (18s)');
+                    await loadCurrentUrl(isLooping ? 'VIDEO LOOPING (FAILOVER)' : 'VIDEO FROZEN (18s)');
                     freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1;
                 }
             } else {
@@ -777,6 +770,7 @@ if (totalDurationMs <= MAX_RUNNER_MS) {
         }
     }
 })();
+
 
 
 
