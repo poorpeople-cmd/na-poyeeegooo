@@ -195,17 +195,13 @@ function setupOBSConfig() {
 // =========================================================================================
 function keepChromeOnTopAndHideOBS() {
     try {
-        // 1. Close & move Auto-Configuration Wizard off-screen for all matched windows
-        execSync('xdotool search --name "Auto-Configuration" windowmove %@ 5000 5000 windowclose %@ || true', { stdio: 'ignore' });
-        // 2. Move ALL OBS windows far off-screen (5000,5000) and minimize them
-        execSync('xdotool search --name "OBS" windowmove %@ 5000 5000 windowminimize %@ || true', { stdio: 'ignore' });
-        execSync('wmctrl -r "OBS" -b add,hidden || true', { stdio: 'ignore' });
-        // 3. Force Chrome window to 0,0 with full resolution and bring to front
-        execSync(`xdotool search --onlyvisible --class "chrome" windowmove %@ 0 0 windowsize %@ ${RES_W} ${RES_H} windowactivate %@ || true`, { stdio: 'ignore' });
+        // Move OBS window far off-screen and minimize it so it never appears on stream
+        execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
+        // Force Chrome window to 0,0 with full resolution and bring to front
+        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
         execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
     } catch (e) {}
 }
-// Dono function names ko link kar diya taake "hideOBSAndFocusChromeOnce is not defined" error kabhi na aaye:
 const hideOBSAndFocusChromeOnce = keepChromeOnTopAndHideOBS;
 // =========================================================================================
 // 🛡️ POPUP & AD FIREWALL + LOADING UI (DRM-Safe CDP + Windows 11 Anti-Detect Spoof)
@@ -601,6 +597,7 @@ async function startWatchdog() {
     while (true) {
         if (!browser || !browser.isConnected()) throw new Error('Browser disconnected');
 
+        keepChromeOnTopAndHideOBS();
         const currentUrl = urlList[currentUrlIndex];
         const health = await checkStreamHealth(page);
 
@@ -754,20 +751,17 @@ async function startEngine() {
     );
 
     // FIXED: Added Script 2's exact Xvfb/Linux video rendering & anti-occlusion flags alongside Script 1's Widevine flags
-    const args = [
+   const args = [
         '--no-sandbox', '--disable-setuid-sandbox', `--window-size=${RES_W},${RES_H}`,
         '--window-position=0,0', '--kiosk', '--start-fullscreen',
         '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage',
-        '--ignore-certificate-errors', '--ignore-gpu-blocklist', '--use-gl=egl',
-        '--disable-accelerated-video-decode', '--disable-accelerated-video-encode',
-        '--disable-gpu-vsync', '--disable-smooth-scrolling',
         '--disable-blink-features=AutomationControlled',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
         '--enable-widevine',
         '--enable-features=EncryptedMedia,Widevine',
-        '--disable-features=PermissionsPolicyHeader,WebRtcHideLocalIpsWithMdns,DisableLoadExtensionCommandLineSwitch,Translate,BlinkGenPropertyTrees,CalculateNativeWinOcclusion,NetworkServiceInProcess2',
+        '--disable-features=PermissionsPolicyHeader,WebRtcHideLocalIpsWithMdns,DisableLoadExtensionCommandLineSwitch,CalculateNativeWinOcclusion',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
         '--enforce-webrtc-ip-permission-check'
     ];
