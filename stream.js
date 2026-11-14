@@ -195,15 +195,18 @@ function setupOBSConfig() {
 // =========================================================================================
 function keepChromeOnTopAndHideOBS() {
     try {
-        // 1. If Auto-Configuration Wizard ever appears, close/move it off-screen immediately
-        execSync('xdotool search --name "Auto-Configuration" windowmove 5000 5000 windowclose || true', { stdio: 'ignore' });
-        // 2. Move OBS window far off-screen (5000,5000) and minimize it so it NEVER appears on stream
-        execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
+        // 1. Close & move Auto-Configuration Wizard off-screen for all matched windows
+        execSync('xdotool search --name "Auto-Configuration" windowmove %@ 5000 5000 windowclose %@ || true', { stdio: 'ignore' });
+        // 2. Move ALL OBS windows far off-screen (5000,5000) and minimize them
+        execSync('xdotool search --name "OBS" windowmove %@ 5000 5000 windowminimize %@ || true', { stdio: 'ignore' });
+        execSync('wmctrl -r "OBS" -b add,hidden || true', { stdio: 'ignore' });
         // 3. Force Chrome window to 0,0 with full resolution and bring to front
-        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
+        execSync(`xdotool search --onlyvisible --class "chrome" windowmove %@ 0 0 windowsize %@ ${RES_W} ${RES_H} windowactivate %@ || true`, { stdio: 'ignore' });
         execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
     } catch (e) {}
 }
+// Dono function names ko link kar diya taake "hideOBSAndFocusChromeOnce is not defined" error kabhi na aaye:
+const hideOBSAndFocusChromeOnce = keepChromeOnTopAndHideOBS;
 // =========================================================================================
 // 🛡️ POPUP & AD FIREWALL + LOADING UI (DRM-Safe CDP + Windows 11 Anti-Detect Spoof)
 // =========================================================================================
@@ -556,24 +559,38 @@ async function checkStreamHealth(p) {
 }
 
 async function loadCurrentUrl(reason) {
-    const targetUrl = urlList[currentUrlIndex];
-    console.log(`\n[🔄] ${reason} -> Loading URL [${currentUrlIndex + 1}/${urlList.length}]: ${targetUrl}`);
+    for (let urlAttempt = 0; urlAttempt < urlList.length; urlAttempt++) {
+        const targetUrl = urlList[currentUrlIndex];
+        console.log(`\n[🔄] ${reason} -> Loading URL [${currentUrlIndex + 1}/${urlList.length}]: ${targetUrl}`);
 
-    try { await obs.call('SetCurrentProgramScene', { sceneName: 'WaitingScene' }); } catch (e) {}
-    try {
-        await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-        await page.bringToFront().catch(() => {});
-        hideOBSAndFocusChromeOnce();
-        await showLoadingOverlay(page, "CONNECTING STREAM", `Server ${currentUrlIndex + 1} of ${urlList.length}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await showLoadingOverlay(page, "OPTIMIZING PLAYER", "Locking fullscreen video...");
-        await lockAndPlayVideo(page);
-        await hideLoadingOverlay(page);
-        hideOBSAndFocusChromeOnce();
-    } catch (e) {
-        console.log(`[⚠️] Page navigation warning: ${e.message}`);
+        try { await obs.call('SetCurrentProgramScene', { sceneName: 'WaitingScene' }); } catch (e) {}
+        let lockSuccess = true;
+        try {
+            await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+            await page.bringToFront().catch(() => {});
+            keepChromeOnTopAndHideOBS();
+            await showLoadingOverlay(page, "CONNECTING STREAM", `Server ${currentUrlIndex + 1} of ${urlList.length}`);
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await showLoadingOverlay(page, "OPTIMIZING PLAYER", "Locking fullscreen video...");
+            lockSuccess = await lockAndPlayVideo(page);
+            if (lockSuccess !== false) {
+                await hideLoadingOverlay(page);
+            }
+            keepChromeOnTopAndHideOBS();
+        } catch (e) {
+            console.log(`[⚠️] Page navigation warning: ${e.message}`);
+        }
+
+        // Agar 403 Protected Content aaye toh foran Next URL load karein
+        if (lockSuccess === false && urlList.length > 1) {
+            currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+            reason = '403 PROTECTED CONTENT -> NEXT URL';
+            continue;
+        }
+
+        try { await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' }); } catch (e) {}
+        break;
     }
-    try { await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' }); } catch (e) {}
 }
 
 async function startWatchdog() {
