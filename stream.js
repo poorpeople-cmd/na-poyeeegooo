@@ -141,7 +141,10 @@ function setupOBSConfig() {
     fs.mkdirSync(scenesDir, { recursive: true });
     fs.mkdirSync(wsPluginDir, { recursive: true });
 
-    fs.writeFileSync(path.join(obsDir, 'global.ini'), `[General]\nLicenseAccepted=true\nFirstRun=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n[OBSWebSocket]\nServerEnabled=true\nServerPort=4455\nServerPassword=secret\n`);
+    const iniConfig = `[General]\nLicenseAccepted=true\nFirstRun=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n[OBSWebSocket]\nServerEnabled=true\nServerPort=4455\nServerPassword=secret\n`;
+    // Write to BOTH global.ini and user.ini (Required for OBS 31/32+ to block Auto-Configuration Wizard)
+    fs.writeFileSync(path.join(obsDir, 'global.ini'), iniConfig);
+    fs.writeFileSync(path.join(obsDir, 'user.ini'), iniConfig);
 
     fs.writeFileSync(path.join(wsPluginDir, 'config.json'), JSON.stringify({
         alerts_enabled: false,
@@ -190,13 +193,17 @@ function setupOBSConfig() {
 // =========================================================================================
 // 🪟 HIDE OBS WINDOW ONCE (Removed destructive 2s xdotool windowsize loop)
 // =========================================================================================
-function hideOBSAndFocusChromeOnce() {
+function keepChromeOnTopAndHideOBS() {
     try {
-        execSync('xdotool search --name "OBS" windowminimize || true', { stdio: 'ignore', timeout: 1500 });
-        execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore', timeout: 1500 });
+        // 1. If Auto-Configuration Wizard ever appears, close/move it off-screen immediately
+        execSync('xdotool search --name "Auto-Configuration" windowmove 5000 5000 windowclose || true', { stdio: 'ignore' });
+        // 2. Move OBS window far off-screen (5000,5000) and minimize it so it NEVER appears on stream
+        execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
+        // 3. Force Chrome window to 0,0 with full resolution and bring to front
+        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
+        execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
     } catch (e) {}
 }
-
 // =========================================================================================
 // 🛡️ POPUP & AD FIREWALL + LOADING UI (DRM-Safe CDP + Windows 11 Anti-Detect Spoof)
 // =========================================================================================
