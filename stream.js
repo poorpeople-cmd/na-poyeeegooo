@@ -1,9 +1,11 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn, execSync } = require('child_process');
 const { OBSWebSocket } = require('obs-websocket-js');
 
@@ -119,11 +121,51 @@ let browser = null;
 let page = null;
 let obsProcess = null;
 
+// =========================================================================================
+// 📊 3-PILLAR HEALTH MONITOR STATE (Network + Manifest + Visual Hash)
+// =========================================================================================
+let netStats = {
+    lastSegmentOkTime: Date.now(),
+    segmentErrorCount: 0,
+    lastHttpStatus: 200,
+    lastMediaSeq: null,
+    lastSeqAdvanceTime: Date.now(),
+    staleManifestCount: 0,
+    programDateTimeLagSec: 0,
+    seenManifest: false
+};
+
+let visualStats = {
+    lastCheckTime: 0,
+    lastHash: null,
+    sameHashSince: Date.now(),
+    recentHashes: [] // Rolling window for repeat/loop detection
+};
+
+function resetMonitorStats() {
+    netStats = {
+        lastSegmentOkTime: Date.now(),
+        segmentErrorCount: 0,
+        lastHttpStatus: 200,
+        lastMediaSeq: null,
+        lastSeqAdvanceTime: Date.now(),
+        staleManifestCount: 0,
+        programDateTimeLagSec: 0,
+        seenManifest: false
+    };
+    visualStats = {
+        lastCheckTime: 0,
+        lastHash: null,
+        sameHashSince: Date.now(),
+        recentHashes: []
+    };
+}
+
 console.log(`[🚀] Engine Locked: ${RES_W}x${RES_H} @ ${BITRATE}kbps | Channel: ${SELECTED_CHANNEL}`);
 console.log(`[📋] Loaded ${urlList.length} URLs for Failover:`, urlList);
 
 // =========================================================================================
-// 🎥 OBS CONFIGURATION
+// 🎥 OBS CONFIGURATION (With OBS 30+ WebSocket Plugin Fix)
 // =========================================================================================
 function setupOBSConfig() {
     const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
@@ -170,7 +212,7 @@ function setupOBSConfig() {
 }
 
 // =========================================================================================
-// 🪟 HIDE OBS WINDOW & FORCE CHROME ON TOP
+// 🪟 HIDE OBS WINDOW & FORCE CHROME ON TOP (X11 / Xvfb Fix)
 // =========================================================================================
 function keepChromeOnTopAndHideOBS() {
     try {
@@ -181,7 +223,7 @@ function keepChromeOnTopAndHideOBS() {
 }
 
 // =========================================================================================
-// 🛡️ POPUP & AD FIREWALL + LOADING UI
+// 🛡️ POPUP & AD FIREWALL + CHECK #1: NETWORK & HLS MANIFEST FRESHNESS MONITOR
 // =========================================================================================
 async function setupPageProtections(p) {
     try {
@@ -191,6 +233,62 @@ async function setupPageProtections(p) {
             const badWords = ['popads', 'exoclick', 'adsterra', 'onclickads', 'doubleclick', 'adexchangerapid', 'bet365', '1xbet'];
             if (badWords.some(w => url.includes(w))) return req.abort().catch(() => {});
             req.continue().catch(() => {});
+        });
+
+        // 📡 CHECK #1 & #3A: Network Status + HLS Manifest Sequence & Program-Date-Time
+        p.on('response', async (res) => {
+            try {
+                const url = res.url().toLowerCase();
+                const status = res.status();
+                const isManifest = url.includes('.m3u8') || url.includes('.mpd');
+                const isSegment = url.includes('.ts') || url.includes('.m4s') || url.includes('.aac') || url.includes('.mp4');
+
+                if (isManifest || isSegment) {
+                    netStats.lastHttpStatus = status;
+                    if (status >= 200 && status < 400) {
+                        netStats.lastSegmentOkTime = Date.now();
+                        netStats.segmentErrorCount = 0;
+                    } else if (status >= 400) {
+                        netStats.segmentErrorCount++;
+                    }
+                }
+
+                // Parse HLS .m3u8 for #EXT-X-MEDIA-SEQUENCE & #EXT-X-PROGRAM-DATE-TIME
+                if (url.includes('.m3u8') && status >= 200 && status < 300) {
+                    const text = await res.text().catch(() => '');
+                    if (text && text.includes('#EXTM3U')) {
+                        const seqMatch = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+                        if (seqMatch) {
+                            netStats.seenManifest = true;
+                            const seq = parseInt(seqMatch[1], 10);
+                            if (netStats.lastMediaSeq !== null && seq === netStats.lastMediaSeq) {
+                                netStats.staleManifestCount++;
+                            } else {
+                                netStats.lastMediaSeq = seq;
+                                netStats.lastSeqAdvanceTime = Date.now();
+                                netStats.staleManifestCount = 0;
+                            }
+                        }
+
+                        const pdtMatches = text.match(/#EXT-X-PROGRAM-DATE-TIME:([^\r\n]+)/gi);
+                        if (pdtMatches && pdtMatches.length > 0) {
+                            const lastPdtLine = pdtMatches[pdtMatches.length - 1];
+                            const isoStr = lastPdtLine.replace(/#EXT-X-PROGRAM-DATE-TIME:/i, '').trim();
+                            const pdtTime = Date.parse(isoStr);
+                            if (!isNaN(pdtTime)) {
+                                netStats.programDateTimeLagSec = Math.round((Date.now() - pdtTime) / 1000);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {}
+        });
+
+        p.on('requestfailed', (req) => {
+            const url = req.url().toLowerCase();
+            if (url.includes('.m3u8') || url.includes('.ts') || url.includes('.m4s')) {
+                netStats.segmentErrorCount++;
+            }
         });
 
         await p.evaluateOnNewDocument(() => {
@@ -263,7 +361,6 @@ async function lockAndPlayVideo(p) {
                         });
                         return isPlaying;
                     }, ENABLE_STREAM_AUDIO);
-
                     if (status) { playing = true; break; }
                 } catch (e) {}
             }
@@ -271,26 +368,26 @@ async function lockAndPlayVideo(p) {
             await new Promise(r => setTimeout(r, 1500));
         }
 
-        // Continuous 1s Lock
+        // Continuous 1s Lock: Fullscreen + Auto-Unpause if Live Pauses + Click Live Button
         for (const frame of p.frames()) {
             if (frame.isDetached()) continue;
             await frame.evaluate((audioEnabled) => {
                 if (window.__frameLockActive) return;
                 window.__frameLockActive = true;
-
                 setInterval(() => {
                     document.documentElement.style.setProperty('background', '#000', 'important');
                     if (document.body) document.body.style.setProperty('background', '#000', 'important');
 
                     const v = document.querySelector('video');
                     if (v) {
+                        // 1. Detect if Live is Paused -> Auto Play & Click Live Edge
                         if (v.paused) {
                             v.play().catch(() => {});
                             const resumeSelectors = '.jw-icon-display, .jw-icon-playback, button[data-plyr="play"], .vjs-play-control, .vjs-big-play-button, .fp-play';
                             document.querySelectorAll(resumeSelectors).forEach(btn => { try { btn.click(); } catch(e){} });
                         }
 
-                        // Click Live button if behind
+                        // Click "Live" button if stream falls behind live edge (e.g., DVR mode)
                         const liveBtns = document.querySelectorAll('.jw-icon-live, .vjs-live-control, [class*="live-button"], [aria-label*="Live"]');
                         liveBtns.forEach(btn => {
                             const cls = (btn.className || '').toString().toLowerCase();
@@ -310,7 +407,7 @@ async function lockAndPlayVideo(p) {
                         }
                     }
 
-                    // Maximize best iframe
+                    // Maximize child player iframe if this frame hosts nested iframes
                     const iframes = Array.from(document.querySelectorAll('iframe'));
                     let best = null, maxArea = 5000;
                     iframes.forEach(f => {
@@ -328,11 +425,61 @@ async function lockAndPlayVideo(p) {
 }
 
 // =========================================================================================
-// 💓 IMPROVED HEALTH CHECK (Pause-Aware + Behind-Live + ReadyState)
+// 🖼️ CHECK #3B: VISUAL FRAME HASH FREEZE & REPEAT-LOOP DETECTION
+// =========================================================================================
+async function checkVisualFreshness(p) {
+    const now = Date.now();
+    if (now - visualStats.lastCheckTime < 6000) {
+        return { visualStatus: 'OK' };
+    }
+    visualStats.lastCheckTime = now;
+
+    try {
+        // Capture lightweight low-res JPEG buffer from browser viewport
+        const buf = await p.screenshot({
+            type: 'jpeg',
+            quality: 25,
+            clip: {
+                x: Math.floor(RES_W * 0.15),
+                y: Math.floor(RES_H * 0.15),
+                width: Math.floor(RES_W * 0.7),
+                height: Math.floor(RES_H * 0.7)
+            }
+        });
+
+        const frameHash = crypto.createHash('md5').update(buf).digest('hex').slice(0, 12);
+
+        // 1. Exact Visual Freeze Check
+        if (visualStats.lastHash === frameHash) {
+            const frozenMs = now - visualStats.sameHashSince;
+            if (frozenMs > 18000) {
+                return { visualStatus: 'VISUAL_FROZEN', frozenSec: Math.round(frozenMs / 1000), hash: frameHash };
+            }
+        } else {
+            visualStats.lastHash = frameHash;
+            visualStats.sameHashSince = now;
+
+            // 2. Content Loop / Repeat Check (Track distinct frame transitions)
+            visualStats.recentHashes.push(frameHash);
+            if (visualStats.recentHashes.length > 18) visualStats.recentHashes.shift();
+
+            const occurrences = visualStats.recentHashes.filter(h => h === frameHash).length;
+            if (occurrences >= 5) {
+                return { visualStatus: 'CONTENT_LOOP', hash: frameHash };
+            }
+        }
+
+        return { visualStatus: 'OK', hash: frameHash };
+    } catch (e) {
+        return { visualStatus: 'OK' };
+    }
+}
+
+// =========================================================================================
+// 💓 CHECK #2: PLAYBACK HEALTH & COMBINED WATCHDOG
 // =========================================================================================
 async function checkStreamHealth(p) {
     if (!p) return { status: 'DEAD' };
-
     try {
         const checks = p.frames().map(async (frame) => {
             if (frame.isDetached()) return null;
@@ -346,33 +493,32 @@ async function checkStreamHealth(p) {
                             ? v.getVideoPlaybackQuality().totalVideoFrames
                             : (v.webkitDecodedFrameCount || 0);
 
-                        // Auto-resume if paused
+                        // Check if live video is paused -> trigger immediate resume
                         if (v.paused) {
                             v.play().catch(() => {});
-                            document.querySelectorAll(
-                                '.jw-icon-display, .jw-icon-playback, .jw-icon-live, .vjs-play-control, .vjs-big-play-button, button[data-plyr="play"], .vjs-live-control'
-                            ).forEach(b => { try { b.click(); } catch(e){} });
+                            const btns = document.querySelectorAll('.jw-icon-display, .jw-icon-live, .vjs-play-control, .vjs-live-control, button[data-plyr="play"]');
+                            btns.forEach(b => { try { b.click(); } catch(e){} });
+                            return {
+                                status: 'PAUSED_RESUMING',
+                                paused: true,
+                                readyState: v.readyState,
+                                currentTime: v.currentTime,
+                                frames
+                            };
                         }
 
-                        const bufferedEnd = v.buffered.length > 0 ? v.buffered.end(v.buffered.length - 1) : 0;
-                        const behindLive = bufferedEnd > 0 && (bufferedEnd - v.currentTime) > 7;
-
-                        let status = 'LOADING_OR_DEAD';
-                        if (v.readyState >= 2 && !v.paused) status = 'HEALTHY';
-                        else if (v.paused) status = 'PAUSED_RESUMING';
-
-                        return {
-                            status,
-                            paused: v.paused,
-                            currentTime: v.currentTime,
-                            frames,
-                            readyState: v.readyState,
-                            networkState: v.networkState,
-                            bufferedEnd,
-                            behindLive
-                        };
+                        if (v.readyState >= 2 || frames > 0) {
+                            return {
+                                status: 'HEALTHY',
+                                paused: false,
+                                readyState: v.readyState,
+                                currentTime: v.currentTime,
+                                frames
+                            };
+                        }
+                        return null;
                     }),
-                    new Promise(r => setTimeout(() => r(null), 1800))
+                    new Promise(r => setTimeout(() => r(null), 1500))
                 ]);
             } catch (e) { return null; }
         });
@@ -390,15 +536,12 @@ async function checkStreamHealth(p) {
     }
 }
 
-// =========================================================================================
-// 🔄 LOAD URL
-// =========================================================================================
 async function loadCurrentUrl(reason) {
     const targetUrl = urlList[currentUrlIndex];
     console.log(`\n[🔄] ${reason} -> Loading URL [${currentUrlIndex + 1}/${urlList.length}]: ${targetUrl}`);
+    resetMonitorStats();
 
     try { await obs.call('SetCurrentProgramScene', { sceneName: 'WaitingScene' }); } catch (e) {}
-
     try {
         await page.goto('about:blank');
         await page.bringToFront();
@@ -412,101 +555,106 @@ async function loadCurrentUrl(reason) {
     } catch (e) {
         console.log(`[⚠️] Page navigation warning: ${e.message}`);
     }
-
     try { await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' }); } catch (e) {}
 }
 
-// =========================================================================================
-// 💓 IMPROVED WATCHDOG (Smarter Freeze Detection)
-// =========================================================================================
 async function startWatchdog() {
-    let lastTime = -1;
-    let lastFrames = -1;
-    let freezeStart = Date.now();
-    let urlStart = Date.now();
-    let deadStrikes = 0;
-    let ticks = 0;
-    let consecutiveNoProgress = 0;
-
-    // Freeze tolerance: ~32-35 seconds of real no progress
-    const FREEZE_TOLERANCE_MS = 32000;
-    const MAX_CONSECUTIVE_NO_PROGRESS = 16; // 16 × 2s = 32s
+    let lastTime = -1, lastFrames = -1, lastWallClock = Date.now();
+    let freezeStart = Date.now(), urlStart = Date.now();
+    let deadStrikes = 0, ticks = 0;
 
     while (true) {
         if (!browser || !browser.isConnected()) throw new Error('Browser disconnected');
-        keepChromeOnTopAndHideOBS();
 
+        keepChromeOnTopAndHideOBS();
         const currentUrl = urlList[currentUrlIndex];
         const health = await checkStreamHealth(page);
 
+        // 1. Evaluate Network & HLS Manifest Freshness
+        let networkState = 'OK';
+        if (netStats.segmentErrorCount >= 6) {
+            networkState = `NET_ERROR_${netStats.lastHttpStatus}`;
+        } else if (netStats.seenManifest && (Date.now() - netStats.lastSeqAdvanceTime > 25000)) {
+            networkState = 'STALE_MANIFEST';
+        }
+
+        // 2. Evaluate Playback & Visual Freshness
         if (health.status === 'HEALTHY' || health.status === 'PAUSED_RESUMING') {
             deadStrikes = 0;
 
-            if (health.status === 'PAUSED_RESUMING' || health.behindLive) {
-                console.log(`[⏯️] Live was paused or behind live edge → forcing play + live click`);
+            if (health.status === 'PAUSED_RESUMING') {
+                console.log(`[⏯️] Live Video was PAUSED -> Sent Auto-Play & Live-Edge click!`);
                 await lockAndPlayVideo(page);
             }
 
-            // Smart movement detection
-            const timeDiff = Math.abs((health.currentTime || 0) - lastTime);
-            const framesDiff = Math.abs((health.frames || 0) - lastFrames);
+            // Calculate playback speed ratio
+            const now = Date.now();
+            const wallElapsed = (now - lastWallClock) / 1000;
+            const timeDelta = lastTime !== -1 ? Math.abs(health.currentTime - lastTime) : wallElapsed;
+            const speedRatio = wallElapsed > 0 ? (timeDelta / wallElapsed).toFixed(2) : '1.00';
+            lastWallClock = now;
 
-            // Time decreased a lot OR frames reset → this is recovery / seek / reload, NOT freeze
-            const isRecovering = (lastTime > 0 && health.currentTime < lastTime - 1.5) ||
-                                 (lastFrames > 50 && health.frames < lastFrames - 20);
+            // Frame or Time moving forward OR backward means player decoder is active
+            const framesMoved = (lastFrames === -1) || (health.frames !== lastFrames);
+            const timeMoved = (lastTime === -1) || (health.currentTime !== lastTime);
+            const isMoving = framesMoved || timeMoved;
 
-            const isMoving = (lastTime === -1) || (lastFrames === -1) ||
-                             timeDiff > 0.08 || framesDiff > 0 || isRecovering;
+            // Run Check #3: Visual Perceptual Hash Check (catches stuck frames & replay loops)
+            const visualCheck = await checkVisualFreshness(page);
 
-            if (isMoving) {
-                consecutiveNoProgress = 0;
+            if (!isMoving) {
+                if (Date.now() - freezeStart > 18000) {
+                    currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+                    await loadCurrentUrl('PLAYBACK FROZEN (No Frame/Time Movement for 18s)');
+                    freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                    continue;
+                }
+            } else if (visualCheck.visualStatus === 'VISUAL_FROZEN') {
+                currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+                await loadCurrentUrl(`VISUAL SCREEN FROZEN (${visualCheck.frozenSec}s Static Frame)`);
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                continue;
+            } else if (visualCheck.visualStatus === 'CONTENT_LOOP') {
+                currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+                await loadCurrentUrl('FRESHNESS FAIL (Repeating Visual Loop Detected)');
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                continue;
+            } else if (networkState === 'STALE_MANIFEST' || networkState.startsWith('NET_ERROR')) {
+                currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+                await loadCurrentUrl(`NETWORK/MANIFEST FAIL (${networkState})`);
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
+                continue;
+            } else {
+                // All 3 Checks Healthy!
                 lastTime = health.currentTime;
                 lastFrames = health.frames;
                 freezeStart = Date.now();
                 await hideLoadingOverlay(page);
-            } else {
-                consecutiveNoProgress++;
-                if (Date.now() - freezeStart > FREEZE_TOLERANCE_MS && consecutiveNoProgress >= MAX_CONSECUTIVE_NO_PROGRESS) {
-                    console.log(`[❄️] Real freeze detected (no progress for ~${Math.round((Date.now() - freezeStart)/1000)}s)`);
-                    currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-                    await loadCurrentUrl('VIDEO FROZEN (No Frame/Time Progress)');
-                    freezeStart = Date.now();
-                    urlStart = Date.now();
-                    lastTime = -1;
-                    lastFrames = -1;
-                    consecutiveNoProgress = 0;
-                }
             }
 
-            // Scheduled refresh (almost never because FORCE_REFRESH is huge)
             const isExempt = NO_REFRESH_DOMAINS.some(d => currentUrl.includes(d));
             if (!isExempt && (Date.now() - urlStart > FORCE_REFRESH_MS)) {
                 await loadCurrentUrl('SCHEDULED REFRESH');
-                freezeStart = Date.now();
-                urlStart = Date.now();
-                lastTime = -1;
-                lastFrames = -1;
-                consecutiveNoProgress = 0;
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
             }
 
+            ticks++;
+            if (ticks === 1 || ticks % 10 === 0) {
+                console.log(
+                    `[💓] REPORT | Net: ${networkState} (HTTP:${netStats.lastHttpStatus}, Seq:${netStats.lastMediaSeq ?? 'N/A'}) | ` +
+                    `Playback: ${health.status} (Speed:${speedRatio}x, Time:${health.currentTime !== undefined ? health.currentTime.toFixed(1) + 's' : 'N/A'}, Frames:${health.frames ?? 'N/A'}) | ` +
+                    `Freshness: ${visualCheck.visualStatus} | URL [${currentUrlIndex + 1}/${urlList.length}]`
+                );
+            }
         } else {
             deadStrikes++;
-            console.log(`[⚠️] Stream Unhealthy (${health.status}) - Strike ${deadStrikes}/5`);
+            console.log(`[⚠️] Stream Unhealthy (${health.status} | Net: ${networkState}) - Strike ${deadStrikes}/5`);
             if (deadStrikes >= 5) {
                 deadStrikes = 0;
                 currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
-                await loadCurrentUrl('5 STRIKES → FAILOVER NEXT URL');
-                freezeStart = Date.now();
-                urlStart = Date.now();
-                lastTime = -1;
-                lastFrames = -1;
-                consecutiveNoProgress = 0;
+                await loadCurrentUrl('5 STRIKES -> FAILOVER NEXT URL');
+                freezeStart = Date.now(); urlStart = Date.now(); lastTime = -1; lastFrames = -1;
             }
-        }
-
-        ticks++;
-        if (ticks === 1 || ticks % 8 === 0) {
-            console.log(`[💓] HEARTBEAT | Status: ${health.status} | Paused: ${health.paused ?? 'N/A'} | Time: ${health.currentTime !== undefined ? health.currentTime.toFixed(1) + 's' : 'N/A'} | Frames: ${health.frames ?? 'N/A'} | RS: ${health.readyState ?? '-'} | BehindLive: ${health.behindLive ?? false} | NoProg: ${consecutiveNoProgress} | URL [${currentUrlIndex + 1}/${urlList.length}]`);
         }
 
         await new Promise(r => setTimeout(r, 2000));
@@ -521,6 +669,7 @@ async function startEngine() {
     setupOBSConfig();
 
     obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray', '--disable-updater']);
+
     obsProcess.stdout.on('data', (data) => {
         const line = data.toString().trim();
         if (line.includes('rtmp') || line.includes('stream') || line.includes('Websocket') || line.includes('output')) {
@@ -547,6 +696,7 @@ async function startEngine() {
             await new Promise(r => setTimeout(r, 2000));
         }
     }
+
     if (obsConnected) {
         try { await obs.call('StartStream'); } catch (e) {}
     }
@@ -616,8 +766,6 @@ setTimeout(() => {
         }
     }
 })();
-
-
 
 
 
