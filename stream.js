@@ -1,522 +1,1223 @@
-
-
 'use strict';
+/**
+ * OBS + Puppeteer live restream engine (fixed version)
+ *
+ * Optional ENV:
+ *   STREAM_QUALITY (360p|480p|720p|1080p)  SERVER_SELECTION  PROXY_ENGINE  ENABLE_STREAM_AUDIO (ON|OFF)
+ *   OKRU_STREAM_ID  TARGET_URLS  CUSTOM_DURATION (24/7 | 10h | 1h 10min | 45m ...)
+ *   X264_PRESET           (default: veryfast <=720p, ultrafast 1080p)
+ *   FREEZE_LIMIT_SEC      (default 25)  playback no-movement limit
+ *   VISUAL_FREEZE_SEC     (default 20)  identical-picture limit
+ *   UNHEALTHY_LIMIT_SEC   (default 30)  no video / paused limit
+ *   STARTUP_GRACE_SEC     (default 45)  extra patience right after loading a URL
+ *   FORCE_REFRESH_MIN     (default 0 = off)
+ *   HANDOVER_AFTER_MIN    (default 350 = 5h50m)
+ *   HANDOVER_OVERLAP_SEC  (default 90)
+ */
 
-const { spawn, execFileSync } = require('node:child_process');
-const { randomBytes } = require('node:crypto');
-const { once } = require('node:events');
-const fs = require('node:fs/promises');
-const net = require('node:net');
-const os = require('node:os');
-const path = require('node:path');
-const { setTimeout: sleep } = require('node:timers/promises');
-const { OBSWebSocket } = require('obs-websocket-js/json');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
-const QUALITY = {
-  '360p': [640, 360, 800],
-  '480p': [854, 480, 1500],
-  '720p': [1280, 720, 3000],
-  '1080p': [1920, 1080, 4500],
-  'Original (1080p Max)': [1920, 1080, 4500],
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const net = require('net');
+const zlib = require('zlib');
+const { spawn, exec, execSync } = require('child_process');
+
+// obs-websocket-js v5 export compatibility (named / default / module itself)
+const obsMod = require('obs-websocket-js');
+const OBSWebSocket = obsMod.OBSWebSocket || obsMod.default || obsMod;
+
+// =========================================================================================
+// 🛡️ GLOBAL CRASH SHIELD
+// =========================================================================================
+process.on('uncaughtException', (err) => console.error('[💥] UNCAUGHT EXCEPTION:', err && err.message));
+process.on('unhandledRejection', (reason) => console.error('[💥] UNHANDLED REJECTION:', reason && reason.message ? reason.message : reason));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const envInt = (name, def) => {
+    const v = parseInt(process.env[name], 10);
+    return Number.isFinite(v) ? v : def;
 };
-const POLL_MS = 2_000;
-const STALL_MS = 18_000;
-const STARTUP_MS = 45_000;
-const AD_DOMAINS = ['popads.net', 'exoclick.com', 'adsterra.com', 'doubleclick.net'];
 
-function parseDuration(value = '24/7') {
-  const input = value.trim().toLowerCase();
-  if (['', '24/7', 'none', '0', 'infinite', 'forever'].includes(input)) return Infinity;
-  if (/^\d+(?:\.\d+)?$/.test(input)) return durationMs(Number(input) * 60_000);
-  const units = { h: 3_600_000, m: 60_000, s: 1_000 };
-  const tokens = /\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/gy;
-  let position = 0;
-  let total = 0;
-  while (position < input.length) {
-    const token = tokens.exec(input);
-    if (!token) throw new Error('Invalid CUSTOM_DURATION. Use 45m, 1h 20m, or 24/7.');
-    total += Number(token[1]) * units[token[2][0]];
-    position = tokens.lastIndex;
-  }
-  return durationMs(total);
+const obs = new OBSWebSocket();
+let obsConnected = false;
+obs.on('ConnectionClosed', () => { obsConnected = false; });
+
+// =========================================================================================
+// ⚙️ CONFIGURATION & ENV VARIABLES
+// =========================================================================================
+const selectedQuality = process.env.STREAM_QUALITY || '720p';
+const SERVER_SELECTION = (process.env.SERVER_SELECTION || 'None').trim();
+const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)';
+const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
+const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
+
+const FREEZE_LIMIT_MS = envInt('FREEZE_LIMIT_SEC', 25) * 1000;
+const VISUAL_FREEZE_MS = envInt('VISUAL_FREEZE_SEC', 20) * 1000;
+const UNHEALTHY_LIMIT_MS = envInt('UNHEALTHY_LIMIT_SEC', 30) * 1000;
+const STARTUP_GRACE_MS = envInt('STARTUP_GRACE_SEC', 45) * 1000;
+const FORCE_REFRESH_MS = envInt('FORCE_REFRESH_MIN', 0) * 60 * 1000; // 0 = disabled
+const HANDOVER_AFTER_MS = envInt('HANDOVER_AFTER_MIN', 350) * 60 * 1000; // 5h50m
+const HANDOVER_OVERLAP_MS = envInt('HANDOVER_OVERLAP_SEC', 90) * 1000;
+const RUN_START = Date.now();
+
+const NO_REFRESH_DOMAINS = [
+    'youtube.com', 'facebook.com', 'streamed.pk', 'cricstreams.',
+    'sport4u.online', 'vercel.app', 'netlify.app'
+];
+
+let RES_W = 1280, RES_H = 720, BITRATE = 3000;
+if (selectedQuality === '360p') { RES_W = 640; RES_H = 360; BITRATE = 800; }
+else if (selectedQuality === '480p') { RES_W = 854; RES_H = 480; BITRATE = 1500; }
+else if (selectedQuality === '720p') { RES_W = 1280; RES_H = 720; BITRATE = 3000; }
+else if (selectedQuality.includes('1080p')) { RES_W = 1920; RES_H = 1080; BITRATE = 4500; }
+
+const X264_PRESET = process.env.X264_PRESET || (RES_H >= 1080 ? 'ultrafast' : 'veryfast');
+
+// ⚠️ SECURITY: In keys ko GitHub Secrets / env mein shift karna behtar hai (STREAM_KEY env override neeche support hai)
+const STREAM_KEYS = {
+    '1'    : '15254238731883_15281627925099_najspfkgne',
+    '1.1'  : '15254260751979_15281671637611_2plrcfqzze',
+    '1.2'  : '15254285524587_15281717840491_7e6qdknzsu',
+    '1.3'  : '16983200374379_18360218880619_efmw4fchxm',
+    '1.4'  : '16983242579563_18360288741995_t2kh2jvcym',
+    '1.5'  : '16983247822443_18360297982571_3zs5ml7gua',
+    '1.6'  : '16983254834795_18360310237803_xrz3pf4uea',
+    '1.7'  : '16983259553387_18360317971051_6khoe5efge',
+    '1.8'  : '16983264468587_18360327342699_wsn7zgr7ee',
+    '1.9'  : '16983269514859_18360335075947_363qzjlbte',
+    '1.10' : '16983277641323_18360347921003_rpf6hkqpdm',
+    '1.11' : '16983286554219_18360360503915_lrqraxbz3y',
+    '2'    : '15254299352683_15281743071851_7dvz3h5d7q',
+    '2.1'  : '15254308986475_15281761618539_3xca7oij3u',
+    '2.2'  : '15254328122987_15281795566187_zjqa6bqzoq',
+    '3'    : '15254341885547_15281821059691_hhlpb5vicy',
+    '3.1'  : '15254357089899_15281848322667_sxeexgvzl4',
+    '3.2'  : '15254367510123_15281868180075_pc4jrytfgm',
+    '3.3'  : '17485986405995_19233134873195_iw63xjblny',
+    '3.4'  : '17485996039787_19233150929515_d3yeoweuam',
+    '3.5'  : '17486002789995_19233161611883_mbg22slybe',
+    '3.6'  : '17486007770731_19233169934955_teme2zt4fm',
+    '4'    : '15255022345835_15283095800427_vwrupxzstm',
+    '4.1'  : '15255038074475_15283122080363_ai5qqp2we4',
+    '4.2'  : '15255045480043_15283135842923_tldl4bhmii',
+    '4.3'  : '15255208599147_15283449629291_abltofuc7m',
+    '4.4'  : '15255217708651_15283466603115_bojrrqtlmu',
+    '4.5'  : '15255227670123_15283486263915_jpntt54mve',
+    '5'    : '17135767461483_18625099401835_4gpytlxk4a',
+    '5.1'  : '15273713933931_15317494860395_avj47smmim',
+    '5.2'  : '15273722257003_15317510195819_6edjluvdqi',
+    '5.3'  : '15273739624043_15317541653099_ii4bxpvabe',
+    '5.4'  : '15273750175339_15317561707115_csel26ku5a',
+    '5.5'  : '15273760071275_15317579467371_cnewcj54me',
+    '5.6'  : '15273767935595_15317595851371_3q43tk7tvm',
+    '5.7'  : '15273778683499_15317616560747_4piekvs4wu',
+    's1.1' : '14204232736303_14846150314543_37jq4ryehq',
+    's1.2' : '14204288179759_14846247373359_tnsknmapva',
+    's1.3' : '14204319768111_14846302489135_sr4ht4ccwq',
+    's1.4' : '14204331957807_14846326147631_dji2acqcze',
+    's1.5' : '14204346572335_14846351641135_7gvns4o5ue',
+    's1.6' : '14204361252399_14846376479279_cjajhf4d3y',
+    's1.7' : '14204370492975_14846393649711_6fduhdqite',
+    's1.8' : '14204395527727_14846438017583_s2jlti7lsm',
+    's1.9' : '14204411387439_14846464887343_f5lxgcqj5y',
+    's1.10': '14204424691247_14846487562799_xmbvntt6wa',
+    's2.1' : '14204490948143_14846603495983_kzevn36tii',
+    's2.2' : '14204506742319_14846634494511_ta2rxyg2oy',
+    's2.3' : '14204523322927_14846661233199_foqb3q7zb4',
+    's2.4' : '14204540034607_14846689085999_gjejdie4uy',
+    's2.5' : '14204555304495_14846715497007_zdanghuxzu',
+    's2.6' : '14204565200431_14846734371375_ap3bqpabpu',
+    's2.7' : '14204577259055_14846756194863_3ecad2535u',
+    's2.8' : '14204592528943_14846785227311_4hjl46y62e',
+    's2.9' : '14204602621487_14846802594351_ilnp6lxekq',
+    's2.10': '14206184136239_14849618610735_ihnbx7hkoi'
+};
+
+const ACTIVE_STREAM_KEY = (process.env.STREAM_KEY || STREAM_KEYS[SELECTED_CHANNEL] || STREAM_KEYS['1']).trim();
+
+// =========================================================================================
+// 🔗 MULTI-URL PARSER
+// =========================================================================================
+const rawUrls = (process.env.TARGET_URLS || 'https://dadocric.st/player.php?id=starsp3&v=m').trim();
+const urlList = rawUrls
+    .split(/[,|\n]/)
+    .map((u) => {
+        let clean = u.split('::')[0].trim().replace(/^!/, '');
+        if (clean && !clean.startsWith('http')) clean = 'https://' + clean;
+        return clean;
+    })
+    .filter((u) => u.length > 8);
+
+if (urlList.length === 0) urlList.push('https://dadocric.st/player.php?id=starsp3&v=m');
+
+let currentUrlIndex = 0;
+let browser = null;
+let page = null;
+let obsProcess = null;
+let shuttingDown = false;
+let pageCrashed = false;
+const abortedReqs = new WeakSet();
+
+// =========================================================================================
+// 📊 3-PILLAR HEALTH MONITOR STATE (Network + Manifest + Visual)
+// =========================================================================================
+function freshNetStats() {
+    return {
+        lastOkTime: Date.now(),
+        errorCount: 0,
+        lastHttpStatus: 200,
+        playlists: new Map(),      // per-playlist sequence tracking (audio/video/variants alag alag hoti hain)
+        lastAdvance: Date.now(),
+        targetDurationSec: 6,
+        seenManifest: false,
+        ended: false,
+        pdtLagSec: null
+    };
+}
+function freshVisualStats() {
+    return { lastCheckTime: 0, lastGrid: null, sameSince: Date.now() };
+}
+let netStats = freshNetStats();
+let visualStats = freshVisualStats();
+
+function resetMonitorStats() {
+    netStats = freshNetStats();
+    visualStats = freshVisualStats();
 }
 
-function durationMs(value) {
-  const rounded = Math.round(value);
-  if (!Number.isSafeInteger(rounded) || rounded <= 0) throw new Error('Invalid CUSTOM_DURATION.');
-  return rounded;
+console.log(`[🚀] Engine Locked: ${RES_W}x${RES_H} @ ${BITRATE}kbps (x264 ${X264_PRESET}) | Channel: ${SELECTED_CHANNEL}`);
+console.log(`[📋] Loaded ${urlList.length} URLs for Failover:`, urlList);
+
+// =========================================================================================
+// 🎥 OBS CONFIGURATION
+// =========================================================================================
+function setupOBSConfig() {
+    const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
+    const profilesDir = path.join(obsDir, 'basic', 'profiles', 'Untitled');
+    const scenesDir = path.join(obsDir, 'basic', 'scenes');
+    const wsPluginDir = path.join(obsDir, 'plugin_config', 'obs-websocket');
+
+    fs.mkdirSync(profilesDir, { recursive: true });
+    fs.mkdirSync(scenesDir, { recursive: true });
+    fs.mkdirSync(wsPluginDir, { recursive: true });
+
+    // [Basic] section zaroori hai warna OBS apna default profile/scene-collection use karta hai
+    fs.writeFileSync(path.join(obsDir, 'global.ini'),
+`[General]
+LicenseAccepted=true
+FirstRun=true
+EnableAutoUpdates=false
+[Basic]
+Profile=Untitled
+ProfileDir=Untitled
+SceneCollection=Untitled
+SceneCollectionFile=Untitled
+[BasicWindow]
+ShowAutoConfig=false
+Warned=true
+[OBSWebSocket]
+ServerEnabled=true
+ServerPort=4455
+ServerPassword=secret
+`);
+
+    fs.writeFileSync(path.join(wsPluginDir, 'config.json'), JSON.stringify({
+        alerts_enabled: false,
+        auth_required: true,
+        first_load: false,
+        server_enabled: true,
+        server_password: 'secret',
+        server_port: 4455
+    }, null, 2));
+
+    fs.writeFileSync(path.join(profilesDir, 'basic.ini'),
+`[General]
+Name=Untitled
+[Video]
+BaseCX=${RES_W}
+BaseCY=${RES_H}
+OutputCX=${RES_W}
+OutputCY=${RES_H}
+FPSType=0
+FPSCommon=30
+[Audio]
+SampleRate=44100
+ChannelSetup=Stereo
+[Output]
+Mode=Advanced
+Reconnect=true
+RetryDelay=2
+MaxRetries=999
+[AdvOut]
+TrackIndex=1
+RecType=Standard
+Encoder=obs_x264
+Rescale=false
+ApplyServiceSettings=false
+Track1Bitrate=128
+`);
+
+    // Advanced mode mein encoder settings streamEncoder.json se aati hain ([obs_x264] section ignore hota hai)
+    fs.writeFileSync(path.join(profilesDir, 'streamEncoder.json'), JSON.stringify({
+        bitrate: BITRATE,
+        rate_control: 'CBR',
+        use_bufsize: true,
+        buffer_size: BITRATE,
+        keyint_sec: 2,
+        preset: X264_PRESET,
+        profile: 'main',
+        tune: 'zerolatency'
+    }, null, 2));
+
+    fs.writeFileSync(path.join(profilesDir, 'service.json'), JSON.stringify({
+        settings: { server: 'rtmp://vsu.okcdn.ru/input/', key: ACTIVE_STREAM_KEY },
+        type: 'rtmp_custom'
+    }, null, 2));
+
+    const sceneJson = {
+        current_scene: 'MainScene',
+        current_program_scene: 'MainScene',
+        name: 'Untitled',
+        scene_order: [{ name: 'WaitingScene' }, { name: 'MainScene' }],
+        sources: [
+            { id: 'xshm_input', name: 'Screen', settings: { show_cursor: false } },
+            { id: 'pulse_output_capture', name: 'Audio', settings: { device_id: 'default' } },
+            { id: 'scene', name: 'MainScene', settings: { id_counter: 2, items: [{ name: 'Screen', id: 1, visible: true }, { name: 'Audio', id: 2, visible: true }] } },
+            { id: 'scene', name: 'WaitingScene', settings: { id_counter: 1, items: [{ name: 'Screen', id: 1, visible: true }] } }
+        ]
+    };
+    fs.writeFileSync(path.join(scenesDir, 'Untitled.json'), JSON.stringify(sceneJson, null, 2));
 }
 
-function readConfig(env) {
-  const quality = env.STREAM_QUALITY || '720p';
-  if (!Object.hasOwn(QUALITY, quality)) throw new Error('Invalid STREAM_QUALITY.');
-  const [width, height, bitrate] = QUALITY[quality];
-  const channel = (env.OKRU_STREAM_ID || '1').trim();
-  if (!/^[a-z0-9]+(?:\.[a-z0-9]+)*$/i.test(channel)) throw new Error('Invalid OK.ru channel.');
-  const urls = (env.TARGET_URLS || '').split(/[,|\n]/).map(value => value.trim()).filter(Boolean).map(value => {
-    const address = value.replace(/^!/, '').split('::')[0].trim();
-    let url;
+// Safety net: agar JSON se scenes/sources load na hon to WebSocket se bana do
+async function ensureObsScenes() {
     try {
-      url = new URL(address.includes('://') ? address : `https://${address}`);
-    } catch {
-      throw new Error('TARGET_URLS contains an invalid URL.');
-    }
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
-      throw new Error('TARGET_URLS requires HTTP(S) URLs without embedded credentials.');
-    }
-    return url.href;
-  });
-  if (!urls.length) throw new Error('Enter at least one URL in TARGET_URLS.');
-
-  let keys;
-  try {
-    keys = JSON.parse(env.OKRU_STREAM_KEYS || '{}');
-  } catch {
-    throw new Error('OKRU_STREAM_KEYS must be a JSON object.');
-  }
-  if (!keys || Array.isArray(keys) || typeof keys !== 'object') throw new Error('OKRU_STREAM_KEYS must be a JSON object.');
-  const key = (Object.hasOwn(keys, channel) && typeof keys[channel] === 'string' ? keys[channel] : '').trim();
-  if (!key) throw new Error(`No OK.ru stream key configured for channel ${channel}.`);
-  let server;
-  try {
-    server = new URL(env.OKRU_RTMP_SERVER || 'rtmp://vsu.okcdn.ru/input/');
-  } catch {
-    throw new Error('Invalid OKRU_RTMP_SERVER.');
-  }
-  if (!['rtmp:', 'rtmps:'].includes(server.protocol)) throw new Error('OKRU_RTMP_SERVER must use RTMP or RTMPS.');
-  const relay = env.RELAY_AFTER_MS ? durationMs(Number(env.RELAY_AFTER_MS)) : Infinity;
-  return {
-    width, height, bitrate, channel, key, server: server.href, urls,
-    selection: (env.SERVER_SELECTION || 'None').trim(),
-    audio: (env.ENABLE_STREAM_AUDIO || 'ON').toUpperCase() === 'ON',
-    warp: (env.PROXY_ENGINE || '').includes('Cloudflare'),
-    duration: parseDuration(env.CUSTOM_DURATION),
-    relay,
-  };
-}
-
-async function bounded(promise, milliseconds, label) {
-  const timer = new AbortController();
-  try {
-    return await Promise.race([
-      promise,
-      sleep(milliseconds, undefined, { signal: timer.signal }).then(() => {
-        throw new Error(`${label} timed out`);
-      }),
-    ]);
-  } finally {
-    timer.abort();
-  }
-}
-
-async function stopProcess(child) {
-  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
-  const exited = once(child, 'exit');
-  child.kill('SIGTERM');
-  await bounded(exited, 3_000, 'OBS shutdown').catch(async () => {
-    child.kill('SIGKILL');
-    await bounded(exited, 1_000, 'OBS shutdown').catch(() => {});
-  });
-}
-
-function captureEnvironment() {
-  const env = { ...process.env };
-  for (const name of ['OKRU_STREAM_KEYS', 'OKRU_RTMP_SERVER', 'GH_TOKEN', 'GITHUB_TOKEN']) delete env[name];
-  return env;
-}
-
-async function openObs(config, runtime) {
-  const obsRoot = path.join(runtime, 'obs-studio');
-  const profile = path.join(obsRoot, 'basic', 'profiles', 'Stream');
-  const plugin = path.join(obsRoot, 'plugin_config', 'obs-websocket');
-  const password = randomBytes(24).toString('hex');
-  const settings = {
-    alerts_enabled: false, auth_required: true, first_load: false,
-    server_enabled: true, server_password: password, server_port: 4455,
-  };
-  await Promise.all([fs.mkdir(profile, { recursive: true }), fs.mkdir(plugin, { recursive: true })]);
-  const globalSettings = '[General]\nLicenseAccepted=true\nFirstRun=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n' +
-    `[OBSWebSocket]\nFirstLoad=false\nServerEnabled=true\nServerPort=4455\nAlertsEnabled=false\nAuthRequired=true\nServerPassword=${password}\n`;
-  await Promise.all([
-    fs.writeFile(path.join(obsRoot, 'global.ini'), globalSettings),
-    fs.writeFile(path.join(obsRoot, 'user.ini'), globalSettings),
-    fs.writeFile(path.join(plugin, 'config.json'), JSON.stringify(settings)),
-    fs.writeFile(path.join(profile, 'basic.ini'),
-      `[General]\nName=Stream\n[Video]\nBaseCX=${config.width}\nBaseCY=${config.height}\nOutputCX=${config.width}\nOutputCY=${config.height}\nFPSCommon=30\n` +
-      `[Audio]\nSampleRate=48000\nChannelSetup=Stereo\n[Output]\nMode=Advanced\nReconnect=true\nRetryDelay=2\nMaxRetries=15\n` +
-      '[AdvOut]\nEncoder=obs_x264\nTrackIndex=1\nTrack1Bitrate=128\n'),
-    fs.writeFile(path.join(profile, 'streamEncoder.json'), JSON.stringify({
-      rate_control: 'CBR', bitrate: config.bitrate, keyint_sec: 2, preset: 'veryfast', profile: 'main',
-    })),
-  ]);
-
-  const child = spawn('obs', [
-    '--profile', 'Stream', '--disable-updater', '--websocket_ipv4_only',
-  ], { env: { ...captureEnvironment(), XDG_CONFIG_HOME: runtime, QT_QPA_PLATFORM: 'xcb' }, stdio: 'ignore' });
-  let launchError;
-  child.on('error', error => { launchError = error.code; });
-  const obs = new OBSWebSocket();
-  const call = (request, data) => bounded(obs.call(request, data), 8_000, request);
-  try {
-    const waitUntil = Date.now() + 30_000;
-    while (true) {
-      if (launchError || child.exitCode !== null || child.signalCode !== null) {
-        throw new Error(`OBS process failed to start (${launchError || child.exitCode || child.signalCode}).`);
-      }
-      try {
-        await bounded(obs.connect('ws://127.0.0.1:4455', password, { rpcVersion: 1 }), 2_000, 'OBS connection');
-        break;
-      } catch {
-        await bounded(obs.disconnect(), 1_000, 'OBS disconnect').catch(() => {});
-        if (Date.now() >= waitUntil) throw new Error('OBS WebSocket did not become ready.');
-        await sleep(700);
-      }
-    }
-
-    await call('SetStreamServiceSettings', {
-      streamServiceType: 'rtmp_custom',
-      streamServiceSettings: { server: config.server, key: config.key },
-    });
-    const specialInputs = await call('GetSpecialInputs');
-    for (const inputName of Object.values(specialInputs)) {
-      if (inputName) await call('SetInputMute', { inputName, inputMuted: true });
-    }
-    await call('CreateScene', { sceneName: 'Broadcast' });
-    await call('CreateScene', { sceneName: 'Waiting' });
-    await call('CreateInput', {
-      sceneName: 'Broadcast', inputName: 'Browser Display', inputKind: 'xshm_input',
-      inputSettings: { screen: 0, show_cursor: false }, sceneItemEnabled: true,
-    });
-    if (config.audio) {
-      await call('CreateInput', {
-        sceneName: 'Broadcast', inputName: 'Browser Audio', inputKind: 'pulse_output_capture',
-        inputSettings: { device_id: process.env.PULSE_SOURCE || 'default' }, sceneItemEnabled: true,
-      });
-    }
-    await call('SetCurrentProgramScene', { sceneName: 'Waiting' });
-    return { obs, call, child };
-  } catch (error) {
-    await bounded(obs.disconnect(), 1_000, 'OBS disconnect').catch(() => {});
-    await stopProcess(child);
-    throw error;
-  }
-}
-
-async function closeObs(engine) {
-  if (!engine) return;
-  await engine.call('StopStream').catch(() => {});
-  await bounded(engine.obs.disconnect(), 2_000, 'OBS disconnect').catch(() => {});
-  await stopProcess(engine.child);
-}
-
-async function openBrowser(config, puppeteer) {
-  const env = captureEnvironment();
-  const args = [
-    '--kiosk', '--window-position=0,0', `--window-size=${config.width},${config.height}`,
-    '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage', '--ozone-platform=x11',
-  ];
-  if (process.env.CHROME_NO_SANDBOX === '1') args.push('--no-sandbox', '--disable-setuid-sandbox');
-  if (!config.audio) args.push('--mute-audio');
-  if (config.warp) args.push('--proxy-server=socks5://127.0.0.1:40000');
-  const extension = path.resolve('ublock-lite');
-  const hasExtension = await fs.access(path.join(extension, 'manifest.json')).then(() => true, () => false);
-  const browser = await puppeteer.launch({
-    headless: false, defaultViewport: null, protocolTimeout: 5_000,
-    enableExtensions: hasExtension ? [extension] : false,
-    args, env, timeout: 30_000, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
-  });
-  try {
-    const page = (await browser.pages())[0] || await browser.newPage();
-    browser.on('targetcreated', target => {
-      if (target.type() === 'page') {
-        void target.page().then(popup => popup && popup !== page ? popup.close() : undefined).catch(() => {});
-      }
-    });
-    page.on('dialog', dialog => void dialog.dismiss().catch(() => {}));
-    await page.setRequestInterception(true);
-    page.on('request', request => {
-      const host = URL.canParse(request.url()) ? new URL(request.url()).hostname : '';
-      const blocked = AD_DOMAINS.some(domain => host === domain || host.endsWith(`.${domain}`));
-      void (blocked ? request.abort() : request.continue()).catch(() => {});
-    });
-    return { browser, page };
-  } catch (error) {
-    await closeBrowser(browser);
-    throw error;
-  }
-}
-
-async function closeBrowser(browser) {
-  if (!browser) return;
-  await bounded(browser.close(), 5_000, 'Chrome shutdown').catch(() => {
-    browser.process()?.kill('SIGKILL');
-  });
-}
-
-async function selectServer(page, label, signal) {
-  if (!label || /^none$/i.test(label)) return;
-  const deadline = Date.now() + 8_000;
-  while (!signal.aborted && Date.now() < deadline) {
-    for (const frame of page.frames()) {
-      const clicked = await frame.evaluate(text => {
-        const labelOf = element => (element.innerText || element.getAttribute('aria-label') || '').trim().toLowerCase();
-        const controls = [...document.querySelectorAll('button, a, [role="button"], [onclick]')]
-          .filter(element => element.getClientRects().length > 0);
-        const control = controls.find(element => labelOf(element) === text) ||
-          controls.find(element => labelOf(element).includes(text));
-        if (!control) return false;
-        control.click();
-        return true;
-      }, label.toLowerCase()).catch(() => false);
-      if (clicked) return;
-    }
-    await sleep(700, undefined, { signal });
-  }
-  console.warn('Selected server button was unavailable. Checking the default player.');
-}
-
-async function sampleVideos(page, resume) {
-  const results = await Promise.all(page.frames().map(async frame => {
-    const videos = await frame.evaluate(tryResume => {
-      const entries = [...document.querySelectorAll('video')];
-      window.streamBotVideoIds ??= new WeakMap();
-      window.streamBotNextVideoId ??= 0;
-      return entries.flatMap(video => {
-        const rect = video.getBoundingClientRect();
-        if (rect.width < 80 || rect.height < 40 || video.ended) return [];
-        if (!window.streamBotVideoIds.has(video)) window.streamBotVideoIds.set(video, ++window.streamBotNextVideoId);
-        if (tryResume && video.paused && !video.error) void video.play().catch(() => {});
-        return [{
-          id: window.streamBotVideoIds.get(video), area: rect.width * rect.height,
-          time: video.currentTime, ready: !video.paused && video.readyState >= 2,
-          frames: video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.webkitDecodedFrameCount ?? 0,
-        }];
-      });
-    }, resume).catch(() => []);
-    return videos.map(video => ({ ...video, frame }));
-  }));
-  return results.flat().sort((a, b) => b.area - a.area);
-}
-
-function progressed(video, previous) {
-  const prior = previous.find(item => item.frame === video.frame && item.id === video.id);
-  return Boolean(video.ready && prior && (video.frames > prior.frames || video.time > prior.time + 0.01));
-}
-
-async function focusVideo(video, audio) {
-  const { frame, id } = video;
-  await frame.evaluate((videoId, enableAudio) => {
-    const videos = [...document.querySelectorAll('video')];
-    const selected = videos.find(item => window.streamBotVideoIds?.get(item) === videoId);
-    if (!selected) return;
-    const css = { position: 'fixed', inset: '0', width: '100vw', height: '100vh', 'z-index': '2147483647',
-      background: 'black', 'object-fit': 'contain', display: 'block' };
-    for (const [name, value] of Object.entries(css)) selected.style.setProperty(name, value, 'important');
-    for (const item of videos) item.muted = !enableAudio || item !== selected;
-    if (enableAudio) selected.volume = 1;
-  }, id, audio);
-
-  let child = frame;
-  while (child.parentFrame()) {
-    const element = await child.frameElement();
-    if (!element) break;
-    try {
-      await element.evaluate(iframe => {
-        const css = { position: 'fixed', inset: '0', width: '100vw', height: '100vh',
-          border: '0', 'z-index': '2147483647', display: 'block' };
-        for (const [name, value] of Object.entries(css)) iframe.style.setProperty(name, value, 'important');
-      });
-    } finally {
-      await element.dispose();
-    }
-    child = child.parentFrame();
-  }
-}
-
-async function waitForProxy() {
-  const connected = new Promise((resolve, reject) => {
-    const socket = net.connect({ host: '127.0.0.1', port: 40000 }, () => {
-      socket.destroy();
-      resolve();
-    });
-    socket.setTimeout(2000, () => socket.destroy(new Error('Proxy timeout')));
-    socket.once('error', reject);
-  });
-  await connected.catch(() => { throw new Error('WARP selected but proxy 127.0.0.1:40000 is unavailable.'); });
-}
-
-async function confirmOutput(engine, signal) {
-  const deadline = Date.now() + 18_000;
-  while (Date.now() < deadline) {
-    const status = await engine.call('GetStreamStatus');
-    if (status.outputActive && !status.outputReconnecting && status.outputBytes > 0) return;
-    await sleep(800, undefined, { signal });
-  }
-  throw new Error('OBS failed to send stream data. Verify the OK.ru server and selected channel key.');
-}
-
-async function run(config, signal, controller) {
-  const { default: puppeteer } = await import('puppeteer');
-  if (config.warp) await waitForProxy();
-  const runtime = await fs.mkdtemp(path.join(os.tmpdir(), 'okru-obs-'));
-  let engine;
-  let browserState;
-  let timer;
-  let relayTimer;
-  let remaining;
-  let onAir = false;
-  let outputFailureSince;
-  let deadline = Infinity;
-  const startedAt = performance.now();
-
-  if (Number.isFinite(config.relay)) {
-    relayTimer = setTimeout(() => {
-      if (onAir) {
-        remaining = config.duration === Infinity ? '24/7' : `${Math.ceil((deadline - performance.now()) / 1000)}s`;
-        if (remaining === '0s' || remaining.startsWith('-')) remaining = undefined;
-      }
-      controller.abort();
-    }, config.relay);
-  }
-
-  try {
-    try {
-      engine = await openObs(config, runtime);
-    } catch (error) {
-      const safeMessage = /^OBS (process|WebSocket)/.test(error.message) ? error.message : 'OBS could not configure the broadcast scene or RTMP service.';
-      throw new Error(safeMessage);
-    }
-    const useScene = name => engine.call('SetCurrentProgramScene', { sceneName: name });
-    let nextUrl = 0;
-    let failures = 0;
-    while (!signal.aborted) {
-      const index = nextUrl;
-      nextUrl = (nextUrl + 1) % config.urls.length;
-      let playbackStarted = false;
-      try {
-        if (!browserState?.browser.connected || browserState.page.isClosed()) {
-          await closeBrowser(browserState?.browser);
-          try {
-            browserState = await openBrowser(config, puppeteer);
-          } catch {
-            throw new Error('Chrome startup failed. Verify the browser installation and X11 display.');
-          }
+        const { scenes } = await obs.call('GetSceneList');
+        const sceneNames = scenes.map((s) => s.sceneName);
+        for (const n of ['WaitingScene', 'MainScene']) {
+            if (!sceneNames.includes(n)) await obs.call('CreateScene', { sceneName: n });
         }
-        const { page, browser } = browserState;
-        console.log(`Loading source ${index + 1}/${config.urls.length}`);
-        const response = await page.goto(config.urls[index], { waitUntil: 'domcontentloaded', timeout: 30_000 });
-        if (response && response.status() >= 400) throw new Error('Source returned an HTTP error.');
-        await page.bringToFront();
-        await selectServer(page, config.selection, signal);
-        let previous = [];
-        let lastProgress = performance.now();
-        let selected;
-        while (!signal.aborted && browser.connected && !page.isClosed()) {
-          const samples = await sampleVideos(page, true);
-          const candidate = selected
-            ? samples.find(video => video.frame === selected.frame && video.id === selected.id)
-            : samples.find(video => progressed(video, previous));
+        const { inputs } = await obs.call('GetInputList');
+        const inputNames = inputs.map((i) => i.inputName);
+        if (!inputNames.includes('Screen')) {
+            await obs.call('CreateInput', { sceneName: 'MainScene', inputName: 'Screen', inputKind: 'xshm_input', inputSettings: { show_cursor: false }, sceneItemEnabled: true });
+        }
+        if (!inputNames.includes('Audio')) {
+            await obs.call('CreateInput', { sceneName: 'MainScene', inputName: 'Audio', inputKind: 'pulse_output_capture', inputSettings: { device_id: 'default' }, sceneItemEnabled: true });
+        }
+        const ensureItem = async (scene, source) => {
+            const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: scene });
+            if (!sceneItems.some((i) => i.sourceName === source)) {
+                await obs.call('CreateSceneItem', { sceneName: scene, sourceName: source });
+            }
+        };
+        await ensureItem('MainScene', 'Screen');
+        await ensureItem('MainScene', 'Audio');
+        await ensureItem('WaitingScene', 'Screen');
+        await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' });
+    } catch (e) {
+        console.log(`[⚠️] ensureObsScenes: ${e.message}`);
+    }
+}
 
-          if (candidate && progressed(candidate, previous)) {
-            lastProgress = performance.now();
-            if (!selected) {
-              await focusVideo(candidate, config.audio);
-              selected = candidate;
-              playbackStarted = true;
-              failures = 0;
-              await useScene('Broadcast');
-              if (!onAir) {
-                await engine.call('StartStream').catch(() => { throw new Error('OBS could not start the OK.ru stream.'); });
-                await confirmOutput(engine, signal);
-                onAir = true;
-                deadline = performance.now() + config.duration;
-                if (Number.isFinite(config.duration)) {
-                  const checkDuration = () => {
-                    const left = deadline - performance.now();
-                    if (left <= 0) controller.abort();
-                    else timer = setTimeout(checkDuration, Math.min(left, 2_147_483_647));
-                  };
-                  checkDuration();
+async function connectOBS(maxTries = 20) {
+    try { await obs.disconnect(); } catch (e) {}
+    for (let i = 0; i < maxTries; i++) {
+        if (shuttingDown) return false;
+        try {
+            await obs.connect('ws://127.0.0.1:4455', 'secret');
+            obsConnected = true;
+            console.log('[+] OBS WebSocket Connected!');
+            return true;
+        } catch (e) {
+            await sleep(2000);
+        }
+    }
+    return false;
+}
+
+async function startOBS() {
+    console.log('[*] Configuring & Starting OBS Studio...');
+    setupOBSConfig();
+    try { execSync('pkill -9 -x obs 2>/dev/null || true', { stdio: 'ignore' }); } catch (e) {}
+
+    // --disable-shutdown-check: pkill -9 ke baad "Safe Mode?" dialog aata hai jo OBS ko block kar deta hai
+    obsProcess = spawn('obs', [
+        '--startstreaming', '--minimize-to-tray', '--disable-updater',
+        '--disable-shutdown-check', '--disable-missing-files-check'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    obsProcess.on('error', (e) => { console.error('[OBS] spawn error:', e.message); obsProcess = null; });
+    obsProcess.on('exit', (code, sig) => {
+        console.log(`[OBS] process exited (code=${code}, signal=${sig})`);
+        obsProcess = null;
+        obsConnected = false;
+    });
+    obsProcess.stdout.on('data', (data) => {
+        const line = data.toString().trim();
+        if (/rtmp|stream|websocket|output/i.test(line)) console.log(`[OBS]: ${line}`);
+    });
+    obsProcess.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (/error|fail/i.test(msg)) console.log(`[OBS Error]: ${msg}`);
+    });
+
+    await sleep(4000);
+    const ok = await connectOBS(20);
+    if (!ok) throw new Error('OBS WebSocket connect failed');
+
+    await ensureObsScenes();
+    try {
+        const st = await obs.call('GetStreamStatus');
+        if (!st.outputActive) await obs.call('StartStream');
+    } catch (e) {
+        console.log(`[⚠️] StartStream: ${e.message}`);
+    }
+}
+
+// OBS ko periodically check karo: process zinda? websocket connected? stream active?
+async function monitorObs(state) {
+    const now = Date.now();
+    if (now - state.lastObsCheck < 10000) return;
+    state.lastObsCheck = now;
+    try {
+        if (!obsProcess) {
+            console.log('[⚠️] OBS process dead -> restarting OBS');
+            await startOBS();
+            return;
+        }
+        if (!obsConnected) {
+            console.log('[⚠️] OBS WebSocket disconnected -> reconnecting');
+            if (!(await connectOBS(3))) return;
+        }
+        const st = await obs.call('GetStreamStatus');
+        if (!st.outputActive && !st.outputReconnecting) {
+            console.log('[⚠️] OBS stream not active -> StartStream');
+            await obs.call('StartStream');
+        }
+    } catch (e) {
+        console.log(`[⚠️] OBS monitor: ${e.message}`);
+        obsConnected = false;
+    }
+}
+
+// =========================================================================================
+// 🪟 HIDE OBS WINDOW & FORCE CHROME ON TOP (X11 / Xvfb) - non-blocking
+// =========================================================================================
+let lastWindowFix = 0;
+function keepChromeOnTopAndHideOBS(force = false) {
+    const now = Date.now();
+    if (!force && now - lastWindowFix < 5000) return;
+    lastWindowFix = now;
+    const cmd =
+        'xdotool search --class "obs" windowmove 5000 5000 windowminimize 2>/dev/null; ' +
+        `xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate 2>/dev/null; ` +
+        'wmctrl -x -a chrome 2>/dev/null; true';
+    exec(cmd, { timeout: 4000 }, () => {});
+}
+
+// =========================================================================================
+// 🎬 IN-PAGE FRAME LOCK (har frame mein chalta hai: fullscreen + auto-resume + live-edge)
+// Ye function evaluateOnNewDocument se inject hota hai, isliye iframe reload hone par bhi wapas aa jata hai.
+// =========================================================================================
+function frameLockFn(audioEnabled) {
+    if (window.__frameLockActive) return;
+    window.__frameLockActive = true;
+
+    let pausedTicks = 0;
+    let lastLiveSeek = 0;
+    const PLAY_BTN = '.jw-icon-display, .jw-icon-playback, button[data-plyr="play"], .vjs-big-play-button, .vjs-play-control, .fp-play';
+    const LIVE_BTN = '.jw-icon-live, .vjs-live-control, [class*="live-button"], [aria-label*="Live"]';
+
+    const pickVideo = () => {
+        let best = null, bestScore = -1;
+        document.querySelectorAll('video').forEach((v) => {
+            const score = (v.clientWidth || 0) * (v.clientHeight || 0) + (!v.paused ? 1e7 : 0);
+            if (score > bestScore) { bestScore = score; best = v; }
+        });
+        return best;
+    };
+
+    setInterval(() => {
+        try {
+            if (document.documentElement) document.documentElement.style.setProperty('background', '#000', 'important');
+            if (document.body) {
+                document.body.style.setProperty('background', '#000', 'important');
+                document.body.style.setProperty('overflow', 'hidden', 'important');
+                document.body.style.setProperty('margin', '0', 'important');
+            }
+
+            const v = pickVideo();
+            if (v) {
+                if (v.paused) {
+                    pausedTicks++;
+                    v.play().catch(() => {});
+                    // Button sirf tab click karo jab play() kaam na kare (warna play+click = dobara pause)
+                    if (pausedTicks >= 3) {
+                        document.querySelectorAll(PLAY_BTN).forEach((b) => { try { b.click(); } catch (e) {} });
+                        pausedTicks = 0;
+                    }
+                } else {
+                    pausedTicks = 0;
                 }
-                console.log(`OBS live on channel ${config.channel} at ${config.width}x${config.height} / 30 FPS`);
-              }
+
+                // Live edge: DVR mode mein pichhe reh jaye to wapas live par
+                document.querySelectorAll(LIVE_BTN).forEach((btn) => {
+                    const cls = (btn.className || '').toString().toLowerCase();
+                    if (cls.includes('not-live') || cls.includes('behind') || cls.includes('dvr')) {
+                        try { btn.click(); } catch (e) {}
+                    }
+                });
+                try {
+                    if (!v.paused && v.duration === Infinity && v.seekable && v.seekable.length) {
+                        const liveEnd = v.seekable.end(v.seekable.length - 1);
+                        if (liveEnd - v.currentTime > 25 && Date.now() - lastLiveSeek > 30000) {
+                            lastLiveSeek = Date.now();
+                            v.currentTime = liveEnd - 2;
+                        }
+                    }
+                } catch (e) {}
+
+                if (v.clientWidth > 50 || !v.paused) {
+                    v.muted = !audioEnabled;
+                    v.volume = audioEnabled ? 1.0 : 0.0;
+                    const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player], .player-poster') || v;
+                    wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
+                    v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
+                    document.querySelectorAll('.jw-controls, .plyr__controls, .vjs-control-bar').forEach((c) => c.style.setProperty('display', 'none', 'important'));
+                    return;
+                }
             }
-          } else if (performance.now() - lastProgress >= (selected ? STALL_MS : STARTUP_MS)) {
-            console.warn(selected ? 'Playback stalled. Trying the next source.' : 'No playback progress during startup. Trying the next source.');
-            break;
-          }
-          if (onAir) {
-            const status = await engine.call('GetStreamStatus');
-            if (status.outputActive && !status.outputReconnecting) outputFailureSince = undefined;
-            else {
-              outputFailureSince ??= performance.now();
-              if (performance.now() - outputFailureSince >= 40_000) {
-                throw new Error('OBS disconnected from the streaming server.');
-              }
-              if (!status.outputActive) await engine.call('StartStream');
+
+            // Is frame mein video nahi: sabse bada child iframe maximize karo
+            const iframes = Array.from(document.querySelectorAll('iframe'));
+            let best = null, maxArea = 5000;
+            iframes.forEach((f) => {
+                const area = f.clientWidth * f.clientHeight;
+                if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
+            });
+            if (best) {
+                iframes.forEach((f) => { if (f !== best) f.style.setProperty('display', 'none', 'important'); });
+                best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;display:block !important;visibility:visible !important;';
             }
-          }
-          previous = samples;
-          await sleep(POLL_MS, undefined, { signal });
-        }
-      } catch (error) {
-        if (signal.aborted) break;
-        if (error.message.startsWith('Chrome startup failed')) throw error;
-        const obsFailure = /^(OBS |SetCurrentProgramScene|GetStreamStatus|StartStream)/.test(error.message);
-        if (obsFailure || (playbackStarted && !onAir)) {
-          throw new Error('OBS broadcast failed. Check OBS availability and your OK.ru stream settings.');
-        }
-        console.warn(`Source ${index + 1} became unavailable. Trying the next source.`);
-      }
-      if (signal.aborted) break;
-      await useScene('Waiting');
-      if (!playbackStarted) failures++;
-      if (failures >= config.urls.length * 3 && !onAir) throw new Error('No source produced playable video after three passes.');
-      if (failures >= config.urls.length * 6) throw new Error('All sources remained unavailable during recovery.');
-      await sleep(Math.min(1_000 + failures * 1_000, 10_000), undefined, { signal });
+        } catch (e) {}
+    }, 1000);
+}
+
+// =========================================================================================
+// 🛡️ POPUP & AD FIREWALL + CHECK #1: NETWORK & HLS MANIFEST FRESHNESS
+// =========================================================================================
+const BAD_WORDS = ['popads', 'exoclick', 'adsterra', 'onclickads', 'doubleclick', 'adexchangerapid', 'bet365', '1xbet'];
+const MANIFEST_RE = /\.(m3u8|mpd)(?:$|[?#])/;
+const SEGMENT_RE = /\.(ts|m4s|aac|m4a|m4v|mp4)(?:$|[?#])/;
+
+async function setupPageProtections(p) {
+    try {
+        await p.setRequestInterception(true);
+        p.on('request', (req) => {
+            try {
+                if (typeof req.isInterceptResolutionHandled === 'function' && req.isInterceptResolutionHandled()) return;
+                const url = req.url().toLowerCase();
+                if (BAD_WORDS.some((w) => url.includes(w))) {
+                    abortedReqs.add(req);
+                    return req.abort('blockedbyclient').catch(() => {});
+                }
+                req.continue().catch(() => {});
+            } catch (e) {}
+        });
+
+        p.on('response', async (res) => {
+            try {
+                const url = res.url();
+                const lower = url.toLowerCase();
+                const isManifest = MANIFEST_RE.test(lower);
+                const isSegment = SEGMENT_RE.test(lower);
+                if (!isManifest && !isSegment) return;
+
+                const status = res.status();
+                netStats.lastHttpStatus = status;
+                if (status >= 200 && status < 400) {
+                    netStats.lastOkTime = Date.now();
+                    netStats.errorCount = 0;
+                } else if (status >= 400) {
+                    netStats.errorCount++;
+                }
+
+                if (/\.m3u8(?:$|[?#])/.test(lower) && status >= 200 && status < 300) {
+                    const text = await res.text().catch(() => '');
+                    if (!text || !text.includes('#EXTM3U')) return;
+                    if (text.includes('#EXT-X-STREAM-INF')) return; // master playlist: sequence nahi hoti
+
+                    if (/#EXT-X-ENDLIST/i.test(text)) netStats.ended = true;
+
+                    const tdMatch = text.match(/#EXT-X-TARGETDURATION:(\d+)/i);
+                    if (tdMatch) netStats.targetDurationSec = parseInt(tdMatch[1], 10) || 6;
+
+                    const seqMatch = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+                    if (seqMatch) {
+                        netStats.seenManifest = true;
+                        const seq = parseInt(seqMatch[1], 10);
+                        const key = lower.split('?')[0];
+                        const entry = netStats.playlists.get(key);
+                        if (!entry || entry.seq !== seq) {
+                            netStats.playlists.set(key, { seq, advanceTime: Date.now() });
+                            netStats.lastAdvance = Date.now();
+                        }
+                    }
+
+                    const pdtMatches = text.match(/#EXT-X-PROGRAM-DATE-TIME:([^\r\n]+)/gi);
+                    if (pdtMatches && pdtMatches.length > 0) {
+                        const iso = pdtMatches[pdtMatches.length - 1].replace(/#EXT-X-PROGRAM-DATE-TIME:/i, '').trim();
+                        const t = Date.parse(iso);
+                        if (!isNaN(t)) netStats.pdtLagSec = Math.round((Date.now() - t) / 1000);
+                    }
+                }
+            } catch (e) {}
+        });
+
+        p.on('requestfailed', (req) => {
+            try {
+                if (abortedReqs.has(req)) return; // humne khud block kiya
+                const u = req.url().toLowerCase();
+                if (!MANIFEST_RE.test(u) && !SEGMENT_RE.test(u)) return;
+                const err = (req.failure() && req.failure().errorText) || '';
+                if (err.includes('ERR_ABORTED')) return; // player ne khud cancel kiya (ABR switch / navigation)
+                netStats.errorCount++;
+            } catch (e) {}
+        });
+
+        p.on('error', (e) => { console.log(`[💥] Page crashed: ${e && e.message}`); pageCrashed = true; });
+        p.on('close', () => { pageCrashed = true; });
+
+        await p.evaluateOnNewDocument(() => {
+            window.open = () => null;
+            window.alert = () => {};
+            window.confirm = () => true;
+            window.prompt = () => null;
+        });
+        await p.evaluateOnNewDocument(frameLockFn, ENABLE_STREAM_AUDIO);
+    } catch (e) {
+        console.log(`[⚠️] setupPageProtections: ${e.message}`);
     }
-  } catch (error) {
-    if (!signal.aborted) throw error;
-  } finally {
-    clearTimeout(timer);
-    clearTimeout(relayTimer);
-    await closeObs(engine);
-    await closeBrowser(browserState?.browser);
-    await fs.rm(runtime, { recursive: true, force: true });
-  }
-
-  if (!onAir && performance.now() - startedAt >= config.relay) throw new Error('Relay deadline reached before OBS could start.');
-  if (remaining && process.env.GITHUB_OUTPUT) {
-    await fs.appendFile(process.env.GITHUB_OUTPUT, `next_duration=${remaining}\n`);
-    console.log(`Finished this runner. Remaining duration: ${remaining}`);
-  }
 }
 
-async function main() {
-  const config = readConfig(process.env);
-  if (process.argv.includes('--check-config')) {
-    console.log(`Configuration valid for channel ${config.channel} and ${config.urls.length} source(s).`);
-    return;
-  }
-  if (!process.env.DISPLAY) throw new Error('An X11 display is required. Run the workflow or start under Xvfb.');
-  const controller = new AbortController();
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => controller.abort(signal));
-  try {
-    execFileSync('xsetroot', ['-solid', 'black'], { stdio: 'ignore', env: captureEnvironment() });
-  } catch {
-    // The dedicated OBS waiting scene still provides a black output.
-  }
-  await run(config, controller.signal, controller);
+async function showLoadingOverlay(p, title, subtitle) {
+    try {
+        await p.evaluate((t, s) => {
+            if (window.self !== window.top) return;
+            let el = document.getElementById('bot-loading-ui');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'bot-loading-ui';
+                el.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;background:#000;z-index:2147483647;display:flex;flex-direction:column;justify-content:center;align-items:center;color:#fff;font-family:sans-serif;';
+                (document.body || document.documentElement).appendChild(el);
+            }
+            el.innerHTML = `<h1 style="font-size:38px;margin-bottom:10px;color:#e50914;">${t}</h1><p style="font-size:20px;color:#aaa;">${s}</p>`;
+        }, title, subtitle);
+    } catch (e) {}
 }
 
-if (require.main === module) {
-  main().catch(error => {
-    console.error(`[ERROR] ${error.message}`);
-    process.exitCode = 1;
-  });
+async function hideLoadingOverlay(p) {
+    try {
+        await p.evaluate(() => {
+            const el = document.getElementById('bot-loading-ui');
+            if (el) el.remove();
+        });
+    } catch (e) {}
 }
-module.exports = { parseDuration, readConfig, progressed };
 
+// =========================================================================================
+// 🎬 PLAYER AUTO-PLAY / SERVER SELECT
+// =========================================================================================
+async function selectServer(p) {
+    if (SERVER_SELECTION === 'None') return;
+    for (const frame of p.frames()) {
+        if (frame.isDetached()) continue;
+        const clicked = await frame.evaluate((srv) => {
+            // Sabse chhota matching element chuno (pehle wala "div" poora page container hota tha)
+            const cands = Array.from(document.querySelectorAll('button, a, li, span, div'))
+                .filter((e) => e.innerText && e.innerText.includes(srv) && e.innerText.length < srv.length + 40);
+            cands.sort((a, b) => a.innerText.length - b.innerText.length);
+            if (cands[0]) { cands[0].click(); return true; }
+            return false;
+        }, SERVER_SELECTION).catch(() => false);
+        if (clicked) { await sleep(2000); return; }
+    }
+}
+
+async function lockAndPlayVideo(p) {
+    if (!p || p.isClosed()) return;
+    try {
+        await selectServer(p);
+
+        for (let attempt = 0; attempt < 8; attempt++) {
+            let playing = false;
+            for (const frame of p.frames()) {
+                if (frame.isDetached()) continue;
+                try {
+                    const status = await frame.evaluate((audioEnabled) => {
+                        const vids = Array.from(document.querySelectorAll('video'));
+                        let isPlaying = false;
+                        vids.forEach((v) => {
+                            v.muted = !audioEnabled;
+                            v.volume = audioEnabled ? 1.0 : 0.0;
+                            if (v.paused) v.play().catch(() => {});
+                            if (!v.paused && v.readyState >= 2) isPlaying = true;
+                        });
+                        // Buttons tab click karo jab video na ho ya play() ke baad bhi paused ho
+                        // (video element ko kabhi click nahi karte: click = pause toggle)
+                        if (vids.length === 0 || vids.every((v) => v.paused)) {
+                            const sel = '.jw-icon-display, .jw-icon-playback, button[data-plyr="play"], .vjs-big-play-button, .vjs-play-control, .fp-play, [class*="unmute"]';
+                            document.querySelectorAll(sel).forEach((el) => { try { el.click(); } catch (e) {} });
+                        }
+                        return isPlaying;
+                    }, ENABLE_STREAM_AUDIO);
+                    if (status) { playing = true; break; }
+                } catch (e) {}
+            }
+            if (playing) break;
+            await sleep(1500);
+        }
+
+        // Fallback: agar evaluateOnNewDocument kisi frame mein na chala ho
+        for (const frame of p.frames()) {
+            if (frame.isDetached()) continue;
+            await frame.evaluate(frameLockFn, ENABLE_STREAM_AUDIO).catch(() => {});
+        }
+    } catch (e) {}
+}
+
+// =========================================================================================
+// 🖼️ CHECK #3: VISUAL FREEZE (tiny PNG decode + grid compare, koi extra dependency nahi)
+// =========================================================================================
+function decodePng(buf) {
+    if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error('not a PNG');
+    let pos = 8, width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;
+    const idat = [];
+    while (pos < buf.length) {
+        const len = buf.readUInt32BE(pos);
+        const type = buf.toString('ascii', pos + 4, pos + 8);
+        const data = buf.subarray(pos + 8, pos + 8 + len);
+        if (type === 'IHDR') {
+            width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+            bitDepth = data[8]; colorType = data[9]; interlace = data[12];
+        } else if (type === 'IDAT') idat.push(data);
+        else if (type === 'IEND') break;
+        pos += 12 + len;
+    }
+    if (bitDepth !== 8 || interlace !== 0 || (colorType !== 2 && colorType !== 6)) throw new Error('unsupported PNG format');
+    const bpp = colorType === 6 ? 4 : 3;
+    const raw = zlib.inflateSync(Buffer.concat(idat));
+    const stride = width * bpp;
+    const out = Buffer.alloc(stride * height);
+    for (let y = 0; y < height; y++) {
+        const ft = raw[y * (stride + 1)];
+        const rs = y * (stride + 1) + 1;
+        for (let x = 0; x < stride; x++) {
+            const r = raw[rs + x];
+            const a = x >= bpp ? out[y * stride + x - bpp] : 0;
+            const b = y > 0 ? out[(y - 1) * stride + x] : 0;
+            const c = (x >= bpp && y > 0) ? out[(y - 1) * stride + x - bpp] : 0;
+            let v;
+            switch (ft) {
+                case 0: v = r; break;
+                case 1: v = r + a; break;
+                case 2: v = r + b; break;
+                case 3: v = r + ((a + b) >> 1); break;
+                case 4: {
+                    const pp = a + b - c, pa = Math.abs(pp - a), pb = Math.abs(pp - b), pc = Math.abs(pp - c);
+                    v = r + ((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c));
+                    break;
+                }
+                default: throw new Error('bad PNG filter');
+            }
+            out[y * stride + x] = v & 255;
+        }
+    }
+    return { width, height, bpp, data: out };
+}
+
+function grayGrid(pngBuf) {
+    const img = decodePng(Buffer.from(pngBuf));
+    const GW = 9, GH = 8, grid = new Array(GW * GH);
+    for (let gy = 0; gy < GH; gy++) {
+        for (let gx = 0; gx < GW; gx++) {
+            const px = Math.min(img.width - 1, Math.floor((gx + 0.5) * img.width / GW));
+            const py = Math.min(img.height - 1, Math.floor((gy + 0.5) * img.height / GH));
+            const i = (py * img.width + px) * img.bpp;
+            grid[gy * GW + gx] = 0.299 * img.data[i] + 0.587 * img.data[i + 1] + 0.114 * img.data[i + 2];
+        }
+    }
+    return grid;
+}
+
+async function checkVisualFreshness(p) {
+    const now = Date.now();
+    if (now - visualStats.lastCheckTime < 6000) return { visualStatus: 'OK' };
+    visualStats.lastCheckTime = now;
+
+    try {
+        const dims = await p.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+        // Chrome khud 5% scale par screenshot deta hai -> bohat halka (~50x30 px)
+        const buf = await p.screenshot({
+            type: 'png',
+            captureBeyondViewport: false,
+            clip: {
+                x: Math.floor(dims.w * 0.1), y: Math.floor(dims.h * 0.1),
+                width: Math.floor(dims.w * 0.8), height: Math.floor(dims.h * 0.8),
+                scale: 0.05
+            }
+        });
+        const grid = grayGrid(buf);
+
+        if (visualStats.lastGrid) {
+            let sum = 0;
+            for (let i = 0; i < grid.length; i++) sum += Math.abs(grid[i] - visualStats.lastGrid[i]);
+            const mad = sum / grid.length;
+            if (mad < 0.5) {
+                const frozenMs = now - visualStats.sameSince;
+                if (frozenMs > VISUAL_FREEZE_MS) return { visualStatus: 'VISUAL_FROZEN', frozenSec: Math.round(frozenMs / 1000) };
+                return { visualStatus: 'OK' };
+            }
+        }
+        visualStats.lastGrid = grid;
+        visualStats.sameSince = now;
+        return { visualStatus: 'OK' };
+    } catch (e) {
+        return { visualStatus: 'OK' };
+    }
+}
+
+// =========================================================================================
+// 💓 CHECK #2: PLAYBACK HEALTH
+// =========================================================================================
+async function checkStreamHealth(p) {
+    if (!p || p.isClosed()) return { status: 'DEAD' };
+    try {
+        const checks = p.frames().map(async (frame) => {
+            if (frame.isDetached()) return null;
+            try {
+                return await Promise.race([
+                    frame.evaluate(() => {
+                        let best = null, bestScore = -1;
+                        document.querySelectorAll('video').forEach((v) => {
+                            const score = (v.clientWidth || 0) * (v.clientHeight || 0) + (!v.paused ? 1e7 : 0);
+                            if (score > bestScore) { bestScore = score; best = v; }
+                        });
+                        const v = best;
+                        if (!v) return null;
+                        const frames = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : (v.webkitDecodedFrameCount || 0);
+                        const base = { paused: v.paused, readyState: v.readyState, currentTime: v.currentTime, frames };
+                        if (v.paused) return Object.assign({ status: 'PAUSED' }, base);
+                        if (v.readyState >= 2 || frames > 0) return Object.assign({ status: 'HEALTHY' }, base);
+                        return null;
+                    }),
+                    new Promise((r) => setTimeout(() => r(null), 1500))
+                ]);
+            } catch (e) { return null; }
+        });
+
+        const results = await Promise.all(checks);
+        const healthy = results.find((r) => r && r.status === 'HEALTHY');
+        if (healthy) return healthy;
+        const paused = results.find((r) => r && r.status === 'PAUSED');
+        if (paused) return paused;
+        return { status: 'LOADING_OR_DEAD' };
+    } catch (e) {
+        return { status: 'DEAD' };
+    }
+}
+
+function evaluateNetwork() {
+    const now = Date.now();
+    if (netStats.errorCount >= 6 && now - netStats.lastOkTime > 12000) return `NET_ERROR_${netStats.lastHttpStatus}`;
+    if (netStats.seenManifest && !netStats.ended) {
+        const limit = Math.max(25000, netStats.targetDurationSec * 3000);
+        if (now - netStats.lastAdvance > limit) return 'STALE_MANIFEST';
+    }
+    return 'OK';
+}
+
+// =========================================================================================
+// 🔄 URL LOADING & WATCHDOG
+// =========================================================================================
+async function loadCurrentUrl(reason) {
+    const targetUrl = urlList[currentUrlIndex];
+    console.log(`\n[🔄] ${reason} -> Loading URL [${currentUrlIndex + 1}/${urlList.length}]: ${targetUrl}`);
+
+    try { await obs.call('SetCurrentProgramScene', { sceneName: 'WaitingScene' }); } catch (e) {}
+    try {
+        await page.goto('about:blank');
+        await page.bringToFront();
+        keepChromeOnTopAndHideOBS(true);
+        await showLoadingOverlay(page, 'CONNECTING STREAM', `Server ${currentUrlIndex + 1} of ${urlList.length}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        resetMonitorStats(); // navigation se aane wale purane abort/errors ko ignore karo
+        await showLoadingOverlay(page, 'OPTIMIZING PLAYER', 'Locking fullscreen video...');
+        await lockAndPlayVideo(page);
+        await hideLoadingOverlay(page);
+        keepChromeOnTopAndHideOBS(true);
+    } catch (e) {
+        resetMonitorStats();
+        console.log(`[⚠️] Page navigation warning: ${e.message}`);
+    }
+    try { await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' }); } catch (e) {}
+}
+
+async function startWatchdog() {
+    const st = {
+        lastTime: -1, lastFrames: -1, lastWall: Date.now(),
+        freezeStart: Date.now(), urlStart: Date.now(), loadedAt: Date.now(),
+        unhealthySince: null, lastResumeAt: 0, lastObsCheck: 0
+    };
+    let ticks = 0;
+
+    const resetWatch = () => {
+        st.lastTime = -1; st.lastFrames = -1; st.lastWall = Date.now();
+        st.freezeStart = Date.now(); st.urlStart = Date.now(); st.loadedAt = Date.now();
+        st.unhealthySince = null;
+    };
+    const failover = async (reason) => {
+        currentUrlIndex = (currentUrlIndex + 1) % urlList.length;
+        await loadCurrentUrl(reason);
+        resetWatch();
+    };
+
+    resetWatch();
+
+    while (!shuttingDown) {
+        if (!browser || !browser.isConnected()) throw new Error('Browser disconnected');
+        if (!page || page.isClosed() || pageCrashed) throw new Error('Page closed or crashed');
+
+        keepChromeOnTopAndHideOBS();
+        await monitorObs(st);
+
+        const now = Date.now();
+        const currentUrl = urlList[currentUrlIndex];
+        const inGrace = now - st.loadedAt < STARTUP_GRACE_MS;
+        const health = await checkStreamHealth(page);
+
+        if (health.status === 'HEALTHY') {
+            st.unhealthySince = null;
+
+            const wallElapsed = (now - st.lastWall) / 1000;
+            const timeDelta = st.lastTime !== -1 ? Math.abs(health.currentTime - st.lastTime) : wallElapsed;
+            const speedRatio = wallElapsed > 0 ? (timeDelta / wallElapsed).toFixed(2) : '1.00';
+            st.lastWall = now;
+
+            const framesMoved = st.lastFrames === -1 || health.frames !== st.lastFrames;
+            const timeMoved = st.lastTime === -1 || health.currentTime !== st.lastTime;
+            const isMoving = framesMoved || timeMoved;
+
+            if (!isMoving) {
+                if (now - st.freezeStart > FREEZE_LIMIT_MS) {
+                    await failover(`PLAYBACK FROZEN (No Frame/Time Movement for ${Math.round(FREEZE_LIMIT_MS / 1000)}s)`);
+                    continue;
+                }
+            } else {
+                st.freezeStart = now;
+                st.lastTime = health.currentTime;
+                st.lastFrames = health.frames;
+            }
+
+            const visual = await checkVisualFreshness(page);
+            if (visual.visualStatus === 'VISUAL_FROZEN') {
+                await failover(`VISUAL SCREEN FROZEN (${visual.frozenSec}s identical picture)`);
+                continue;
+            }
+
+            const networkState = evaluateNetwork();
+            if (networkState !== 'OK') {
+                await failover(`NETWORK/MANIFEST FAIL (${networkState})`);
+                continue;
+            }
+
+            await hideLoadingOverlay(page);
+
+            const isExempt = NO_REFRESH_DOMAINS.some((d) => currentUrl.includes(d));
+            if (FORCE_REFRESH_MS > 0 && !isExempt && now - st.urlStart > FORCE_REFRESH_MS) {
+                await loadCurrentUrl('SCHEDULED REFRESH');
+                resetWatch();
+                continue;
+            }
+
+            ticks++;
+            if (ticks === 1 || ticks % 10 === 0) {
+                console.log(
+                    `[💓] REPORT | Net: ${networkState} (HTTP:${netStats.lastHttpStatus}, ManifestAge:${netStats.seenManifest ? Math.round((now - netStats.lastAdvance) / 1000) + 's' : 'N/A'}, PDT-lag:${netStats.pdtLagSec ?? 'N/A'}s) | ` +
+                    `Playback: ${health.status} (Speed:${speedRatio}x, Time:${health.currentTime.toFixed(1)}s, Frames:${health.frames}) | ` +
+                    `Visual: ${visual.visualStatus} | URL [${currentUrlIndex + 1}/${urlList.length}]`
+                );
+            }
+        } else if (health.status === 'PAUSED') {
+            if (st.unhealthySince === null) st.unhealthySince = now;
+            if (now - st.lastResumeAt > 8000) {
+                st.lastResumeAt = now;
+                console.log('[⏯️] Video PAUSED -> Auto-Play & Live-Edge resume');
+                await lockAndPlayVideo(page);
+            }
+            if (now - st.unhealthySince > UNHEALTHY_LIMIT_MS) {
+                await failover(`PAUSED TOO LONG (${Math.round(UNHEALTHY_LIMIT_MS / 1000)}s)`);
+                continue;
+            }
+        } else {
+            if (st.unhealthySince === null) st.unhealthySince = now;
+            const limit = inGrace ? Math.max(STARTUP_GRACE_MS, UNHEALTHY_LIMIT_MS) : UNHEALTHY_LIMIT_MS;
+            const bad = now - st.unhealthySince;
+            console.log(`[⚠️] Stream Unhealthy (${health.status} | Net: ${evaluateNetwork()}) - ${Math.round(bad / 1000)}s/${Math.round(limit / 1000)}s`);
+            if (now - st.lastResumeAt > 15000) {
+                st.lastResumeAt = now;
+                await lockAndPlayVideo(page);
+            }
+            if (bad > limit) {
+                await failover('NO HEALTHY VIDEO -> FAILOVER NEXT URL');
+                continue;
+            }
+        }
+
+        await sleep(2000);
+    }
+}
+
+// =========================================================================================
+// 🚀 BROWSER LAUNCH, ENGINE LOOP & CLEANUP
+// =========================================================================================
+function checkWarpPort() {
+    return new Promise((resolve) => {
+        const s = net.connect({ host: '127.0.0.1', port: 40000 });
+        const done = (ok) => { try { s.destroy(); } catch (e) {} resolve(ok); };
+        s.setTimeout(2000, () => done(false));
+        s.on('connect', () => done(true));
+        s.on('error', () => done(false));
+    });
+}
+
+async function launchBrowser() {
+    const args = [
+        '--no-sandbox', '--disable-setuid-sandbox', `--window-size=${RES_W},${RES_H}`,
+        '--window-position=0,0', '--kiosk', '--start-fullscreen',
+        '--autoplay-policy=no-user-gesture-required', '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled', '--use-gl=egl',
+        '--no-first-run', '--no-default-browser-check', '--disable-infobars',
+        '--hide-crash-restore-bubble', '--disable-session-crashed-bubble',
+        // Background/occluded tab throttling band (OBS window upar aaye to bhi timers na ruken)
+        '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows'
+    ];
+
+    if (PROXY_ENGINE.includes('Cloudflare')) {
+        if (!(await checkWarpPort())) console.log('[⚠️] WARP SOCKS5 127.0.0.1:40000 reachable nahi! Pages load nahi honge.');
+        args.push('--proxy-server=socks5://127.0.0.1:40000');
+    }
+
+    const ublockPath = path.join(process.cwd(), 'ublock-lite');
+    if (fs.existsSync(path.join(ublockPath, 'manifest.json'))) {
+        args.push(`--disable-extensions-except=${ublockPath}`);
+        args.push(`--load-extension=${ublockPath}`);
+        console.log('[🛡️] uBlock Origin Lite MV3 Extension Loading...');
+    }
+
+    pageCrashed = false;
+    browser = await puppeteer.launch({
+        headless: false,
+        defaultViewport: null, // kiosk mein real window size use ho (fixed emulation se black bars aate hain)
+        // Puppeteer default mein --disable-extensions lagata hai: uske bina uBlock load hi nahi hota
+        ignoreDefaultArgs: ['--enable-automation', '--disable-extensions'],
+        args
+    });
+
+    const pages = await browser.pages();
+    page = pages.find((p) => p.url() === 'about:blank') || pages[0] || await browser.newPage();
+    for (const p of pages) { if (p !== page) await p.close().catch(() => {}); }
+
+    browser.on('targetcreated', async (target) => {
+        if (target.type() !== 'page') return;
+        const newPage = await target.page().catch(() => null);
+        if (newPage && newPage !== page) {
+            setTimeout(() => {
+                newPage.close().catch(() => {});
+                if (page && !page.isClosed()) page.bringToFront().catch(() => {});
+            }, 300);
+        }
+    });
+
+    keepChromeOnTopAndHideOBS(true);
+    await setupPageProtections(page);
+    await loadCurrentUrl('INITIAL BOOT');
+}
+
+async function cleanupBrowser() {
+    if (browser) {
+        try { await Promise.race([browser.close(), sleep(5000)]); } catch (e) {}
+        browser = null;
+    }
+    page = null;
+    for (const name of ['chrome', 'chromium', 'google-chrome']) {
+        try { execSync(`pkill -9 -x ${name} 2>/dev/null || true`, { stdio: 'ignore' }); } catch (e) {}
+    }
+}
+
+async function cleanupAll() {
+    try { await obs.disconnect(); } catch (e) {}
+    obsConnected = false;
+    await cleanupBrowser();
+    if (obsProcess) { try { obsProcess.kill('SIGKILL'); } catch (e) {} obsProcess = null; }
+    try { execSync('pkill -9 -x obs 2>/dev/null || true', { stdio: 'ignore' }); } catch (e) {}
+}
+
+async function gracefulExit(code = 0) {
+    if (shuttingDown && code === -1) return;
+    shuttingDown = true;
+    try { if (obsConnected) await obs.call('StopStream'); } catch (e) {}
+    await cleanupAll();
+    process.exit(code === -1 ? 0 : code);
+}
+
+process.on('SIGINT', () => { console.log('[🛑] SIGINT received'); gracefulExit(0); });
+process.on('SIGTERM', () => { console.log('[🛑] SIGTERM received'); gracefulExit(0); });
+
+// =========================================================================================
+// ⏱️ DURATION PARSER & RELAY ENGINE (24/7, 10h, 1h 10min, 0h 10min, 45m, 90 ...)
+// =========================================================================================
+const RAW_DURATION = (process.env.CUSTOM_DURATION || '24/7').trim();
+
+function parseFlexibleDuration(input) {
+    if (!input) return null;
+    const str = input.toLowerCase().trim();
+    if (str === '24/7' || str === 'infinite' || str === 'forever') return null;
+
+    let totalMs = 0, matched = false;
+    const regex = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/g;
+    let match;
+    while ((match = regex.exec(str)) !== null) {
+        matched = true;
+        const val = parseFloat(match[1]);
+        const unit = match[2];
+        if (unit.startsWith('h')) totalMs += val * 3600 * 1000;
+        else if (unit.startsWith('m')) totalMs += val * 60 * 1000;
+        else if (unit.startsWith('s')) totalMs += val * 1000;
+    }
+    // Sirf number likha ho (e.g. "120") -> minutes
+    if (!matched && /^\d+(\.\d+)?$/.test(str)) {
+        totalMs = parseFloat(str) * 60 * 1000;
+        matched = true;
+    }
+
+    if (!matched || totalMs <= 0) {
+        console.log(`[⚠️] CUSTOM_DURATION "${input}" samajh nahi aaya / zero hai -> 24/7 mode use ho raha hai`);
+        return null;
+    }
+    return Math.round(totalMs);
+}
+
+function formatMsToDurationString(ms) {
+    const totalSeconds = Math.max(1, Math.round(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+    if (hours > 0) parts.push(`${hours}h`);
+    if (minutes > 0) parts.push(`${minutes}m`);
+    if (hours === 0 && minutes === 0 && seconds > 0) parts.push(`${seconds}s`);
+    return parts.join(' ') || '1m';
+}
+
+// getNextDuration: function jo trigger ke waqt remaining duration string deta hai (retry par dobara calculate hota hai)
+function triggerNextWorkflow(getNextDuration, attempt = 1) {
+    const nextDurationValue = getNextDuration();
+    console.log(`\n[🔄] Handover (try ${attempt}) -> Launching Next Action with custom_duration="${nextDurationValue}"...`);
+
+    const args = ['workflow', 'run', 'main.yml'];
+    if (process.env.GITHUB_REF_NAME) args.push('--ref', process.env.GITHUB_REF_NAME);
+    args.push(
+        '-f', `target_urls=${process.env.TARGET_URLS || ''}`,
+        '-f', `okru_stream_channel=${SELECTED_CHANNEL}`,
+        '-f', `server_selection=${SERVER_SELECTION}`,
+        '-f', `stream_quality=${selectedQuality}`,
+        '-f', `proxy_engine=${PROXY_ENGINE}`,
+        '-f', `enable_stream_audio=${process.env.ENABLE_STREAM_AUDIO || 'ON'}`,
+        '-f', `custom_duration=${nextDurationValue}`
+    );
+
+    let finished = false;
+    const finish = (code) => {
+        if (finished) return;
+        finished = true;
+        if (code === 0) {
+            console.log(`[+] Next workflow triggered. Overlap ${Math.round(HANDOVER_OVERLAP_MS / 1000)}s ke liye stream chalti rahegi...`);
+            setTimeout(() => gracefulExit(0), HANDOVER_OVERLAP_MS);
+        } else if (attempt < 5) {
+            console.error(`[⚠️] gh workflow run fail (code ${code}). 20s baad retry...`);
+            setTimeout(() => triggerNextWorkflow(getNextDuration, attempt + 1), 20000);
+        } else {
+            console.error('[🚨] Handover 5 baar fail hua (GH_TOKEN / actions:write permission check karo). Stream chalti rahegi jab tak runner band na ho.');
+        }
+    };
+
+    try {
+        const child = spawn('gh', args, { stdio: 'inherit' });
+        child.on('error', (e) => { console.error('[⚠️] gh spawn error:', e.message); finish(-1); });
+        child.on('close', finish);
+    } catch (e) {
+        console.error('[⚠️] Failed to trigger next workflow:', e.message);
+        finish(-1);
+    }
+}
+
+const totalRequestedMs = parseFlexibleDuration(RAW_DURATION);
+
+if (totalRequestedMs === null) {
+    console.log(`[♾️] Duration Mode: 24/7 Infinite | Handover after ${formatMsToDurationString(HANDOVER_AFTER_MS)}.`);
+    setTimeout(() => triggerNextWorkflow(() => '24/7'), HANDOVER_AFTER_MS);
+} else if (totalRequestedMs <= HANDOVER_AFTER_MS) {
+    console.log(`[⏱️] Duration Mode: Fixed (${RAW_DURATION} -> ${formatMsToDurationString(totalRequestedMs)}) | Stream will STOP when timer ends.`);
+    setTimeout(async () => {
+        console.log(`\n[🛑] Target Duration (${RAW_DURATION}) Reached! Stopping OBS & Ending Action...`);
+        await gracefulExit(0);
+    }, totalRequestedMs);
+} else {
+    console.log(`[⏱️] Duration Mode: Long Relay (${RAW_DURATION}) | Running ${formatMsToDurationString(HANDOVER_AFTER_MS)} now, rest goes to next Action.`);
+    setTimeout(() => {
+        triggerNextWorkflow(() => {
+            // Actual elapsed time ke hisaab se remaining nikalo
+            const remaining = totalRequestedMs - (Date.now() - RUN_START);
+            return formatMsToDurationString(remaining);
+        });
+    }, HANDOVER_AFTER_MS);
+}
+
+// =========================================================================================
+// 🔁 MAIN LOOP
+// Browser fail ho to sirf browser restart hota hai (OBS stream chalta rehta hai).
+// 5 consecutive failures ke baad OBS bhi full restart.
+// =========================================================================================
+(async () => {
+    let consecutiveFailures = 0;
+    while (!shuttingDown) {
+        try {
+            if (!obsProcess) await startOBS();
+            await launchBrowser();
+            consecutiveFailures = 0;
+            await startWatchdog();
+        } catch (err) {
+            if (shuttingDown) break;
+            consecutiveFailures++;
+            console.error(`[🚨] Engine Error (#${consecutiveFailures}), restarting in 3s:`, err.message);
+            if (consecutiveFailures >= 5) {
+                console.error('[🚨] Too many failures -> full restart (OBS + Chrome)');
+                await cleanupAll();
+                consecutiveFailures = 0;
+            } else {
+                await cleanupBrowser();
+            }
+            await sleep(3000);
+        }
+    }
+})();
 
 
 
