@@ -1,196 +1,5 @@
 
 
-name: 24/7 OK.ru Simple Stream Bot
-run-name: "OK.ru Live - Ch ${{ inputs.okru_stream_channel }} [${{ inputs.custom_duration || '24/7' }}]"
-
-on:
-  workflow_dispatch:
-    inputs:
-      target_urls:
-        description: 'Comma-separated source page URLs in failover order'
-        required: true
-        type: string
-        default: 'https://dadocric.st/player.php?id=starsp3&v=m'
-      okru_stream_channel:
-        description: 'OK.ru broadcast channel (e.g. 1, 1.1, 2, s1.1)'
-        required: true
-        type: string
-        default: '1'
-      server_selection:
-        description: 'Player server button label. Use None to skip.'
-        required: true
-        type: string
-        default: 'None'
-      stream_quality:
-        description: 'OBS output quality'
-        required: true
-        type: choice
-        options:
-          - 'Original (1080p Max)'
-          - '1080p'
-          - '720p'
-          - '480p'
-          - '360p'
-        default: '720p'
-      proxy_engine:
-        description: 'Browser network connection'
-        required: true
-        type: choice
-        options:
-          - 'Cloudflare WARP (Recommended)'
-          - 'None (Direct GitHub IP)'
-        default: 'Cloudflare WARP (Recommended)'
-      enable_stream_audio:
-        description: 'Stream audio'
-        required: true
-        type: choice
-        options: ['ON', 'OFF']
-        default: 'ON'
-      custom_duration:
-        description: 'Duration (e.g. 3h, 180m, 1h 20m, or 24/7)'
-        required: false
-        type: string
-        default: '24/7'
-
-permissions:
-  contents: read
-  actions: write
-
-concurrency:
-  group: okru-broadcast-${{ inputs.okru_stream_channel }}
-  cancel-in-progress: false
-
-jobs:
-  stream:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
-    env:
-      TARGET_URLS: ${{ inputs.target_urls }}
-      OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
-      SERVER_SELECTION: ${{ inputs.server_selection }}
-      STREAM_QUALITY: ${{ inputs.stream_quality }}
-      PROXY_ENGINE: ${{ inputs.proxy_engine }}
-      ENABLE_STREAM_AUDIO: ${{ inputs.enable_stream_audio }}
-      CUSTOM_DURATION: ${{ inputs.custom_duration || '24/7' }}
-    steps:
-      - name: Checkout project
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: npm
-
-      - name: Install OBS, audio, and X11 dependencies
-        timeout-minutes: 7
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y obs-studio xvfb xauth x11-xserver-utils openbox pulseaudio pulseaudio-utils dbus-x11             libnss3 libgbm1 libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libxss1
-
-      - name: Install Node dependencies and Chrome for Testing
-        timeout-minutes: 7
-        env:
-          PUPPETEER_SKIP_DOWNLOAD: 'true'
-        run: |
-          npm ci --no-audit --no-fund
-          npm run check
-          env -u PUPPETEER_SKIP_DOWNLOAD ./node_modules/.bin/puppeteer browsers install chrome
-
-      - name: Set up WARP local proxy
-        if: inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
-        timeout-minutes: 5
-        run: |
-          curl -fsSL --retry 2 https://pkg.cloudflareclient.com/pubkey.gpg             | sudo gpg --batch --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          printf '%s\n' 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ noble main'             | sudo tee /etc/apt/sources.list.d/cloudflare-client.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-          sudo systemctl start warp-svc
-          warp-cli --accept-tos registration new
-          warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos proxy port 40000
-          warp-cli --accept-tos connect
-          for attempt in {1..15}; do
-            if curl --fail --silent --max-time 4 --proxy socks5h://127.0.0.1:40000               https://www.cloudflare.com/cdn-cgi/trace | tr -d '\r' | grep -Eq '^warp=(on|plus)$'; then
-              echo "Verified WARP browser proxy on port 40000."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::WARP was selected but its proxy could not be verified."
-          exit 1
-
-      - name: Install optional uBlock Origin Lite
-        continue-on-error: true
-        timeout-minutes: 3
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if url=$(gh api repos/uBlockOrigin/uBOL-home/releases/latest             --jq 'first(.assets[]? | select(.name | endswith(".chromium.zip")) | .browser_download_url) // empty')             && [[ "$url" == https://github.com/uBlockOrigin/uBOL-home/releases/download/* ]]; then
-            download=$(mktemp -d)
-            trap 'rm -rf "$download"' EXIT
-            if curl -fsSL --retry 2 --max-time 25 "$url" -o "$download/ubol.zip"               && unzip -q "$download/ubol.zip" -d "$download/extracted"; then
-              manifest=$(find "$download/extracted" -name manifest.json -type f -print -quit)
-              if [[ -n "$manifest" ]]; then
-                mv "$(dirname "$manifest")" ublock-lite
-                exit 0
-              fi
-            fi
-          fi
-          echo "::notice::uBlock Origin Lite is unavailable. Browser popup and domain filtering remain active."
-
-      - name: Broadcast from the virtual display
-        id: broadcast
-        env:
-          OKRU_STREAM_KEYS: ${{ secrets.OKRU_STREAM_KEYS }}
-          OKRU_RTMP_SERVER: ${{ vars.OKRU_RTMP_SERVER }}
-          RELAY_AFTER_MS: '19800000'
-          CHROME_NO_SANDBOX: '1'
-          PULSE_SINK: okru_capture
-          PULSE_SOURCE: okru_capture.monitor
-        run: |
-          node stream.js --check-config
-          if ! pactl info > /dev/null 2>&1; then
-            pulseaudio --start --exit-idle-time=-1
-          fi
-          pactl load-module module-null-sink "sink_name=$PULSE_SINK" rate=48000 >/dev/null
-          pactl set-default-sink "$PULSE_SINK"
-          pactl set-default-source "$PULSE_SOURCE"
-
-          case "$STREAM_QUALITY" in
-            '360p') screen=640x360x24 ;;
-            '480p') screen=854x480x24 ;;
-            '720p') screen=1280x720x24 ;;
-            '1080p'|'Original (1080p Max)') screen=1920x1080x24 ;;
-            *) exit 1 ;;
-          esac
-
-          export LIBGL_ALWAYS_SOFTWARE=1
-          exec xvfb-run -a -s "-screen 0 $screen -nolisten tcp" dbus-run-session -- bash -e -c '
-            openbox >/dev/null 2>&1 &
-            exec node stream.js
-          '
-
-      - name: Dispatch the next run
-        if: steps.broadcast.outputs.next_duration != ''
-        timeout-minutes: 2
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NEXT_DURATION: ${{ steps.broadcast.outputs.next_duration }}
-        run: |
-          gh workflow run main.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"             -f "target_urls=$TARGET_URLS"             -f "okru_stream_channel=$OKRU_STREAM_ID"             -f "server_selection=$SERVER_SELECTION"             -f "stream_quality=$STREAM_QUALITY"             -f "proxy_engine=$PROXY_ENGINE"             -f "enable_stream_audio=$ENABLE_STREAM_AUDIO"             -f "custom_duration=$NEXT_DURATION"
-
-
-
-
-
-
-
 
 
 
@@ -233,161 +42,161 @@ jobs:
 
 
 
-# name: 24/7 OK.ru Simple Stream Bot
+name: 24/7 OK.ru Simple Stream Bot
 
-# run-name: "OK.ru Live - Ch ${{ inputs.okru_stream_channel }} [${{ inputs.custom_duration || '24/7' }}]"
+run-name: "OK.ru Live - Ch ${{ inputs.okru_stream_channel }} [${{ inputs.custom_duration || '24/7' }}]"
 
-# on:
-#   workflow_dispatch:
-#     inputs:
-#       target_urls:
-#         description: 'Comma-separated Target URLs (Server1, Server2, Server3)'
-#         required: true
-#         type: string
-#         default: 'https://dadocric.st/player.php?id=starsp3&v=m'
-#       okru_stream_channel:
-#         description: 'OK.ru Broadcast Channel (e.g., 1, 1.1, 2, s1.1)'
-#         required: true
-#         type: string
-#         default: '1'
-#       server_selection:
-#         description: 'Target Server Button on Page - Type "None" to skip'
-#         required: true
-#         type: string
-#         default: 'None'
-#       stream_quality:
-#         description: 'Select Stream Quality'
-#         required: true
-#         type: choice
-#         options:
-#           - 'Original (1080p Max)'
-#           - '1080p'
-#           - '720p'
-#           - '480p'
-#           - '360p'
-#         default: '720p'
-#       proxy_engine:
-#         description: 'Network Proxy Engine'
-#         required: true
-#         type: choice
-#         options:
-#           - 'Cloudflare WARP (Recommended)'
-#           - 'None (Direct GitHub IP)'
-#         default: 'Cloudflare WARP (Recommended)'
-#       enable_stream_audio:
-#         description: 'Stream Audio (ON / OFF)'
-#         required: true
-#         type: choice
-#         options:
-#           - 'ON'
-#           - 'OFF'
-#         default: 'ON'
-#       custom_duration:
-#         description: 'Stream Duration (e.g., 3h, 180m, 45m, or 24/7)'
-#         required: false
-#         type: string
-#         default: '24/7'
+on:
+  workflow_dispatch:
+    inputs:
+      target_urls:
+        description: 'Comma-separated Target URLs (Server1, Server2, Server3)'
+        required: true
+        type: string
+        default: 'https://dadocric.st/player.php?id=starsp3&v=m'
+      okru_stream_channel:
+        description: 'OK.ru Broadcast Channel (e.g., 1, 1.1, 2, s1.1)'
+        required: true
+        type: string
+        default: '1'
+      server_selection:
+        description: 'Target Server Button on Page - Type "None" to skip'
+        required: true
+        type: string
+        default: 'None'
+      stream_quality:
+        description: 'Select Stream Quality'
+        required: true
+        type: choice
+        options:
+          - 'Original (1080p Max)'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+        default: '720p'
+      proxy_engine:
+        description: 'Network Proxy Engine'
+        required: true
+        type: choice
+        options:
+          - 'Cloudflare WARP (Recommended)'
+          - 'None (Direct GitHub IP)'
+        default: 'Cloudflare WARP (Recommended)'
+      enable_stream_audio:
+        description: 'Stream Audio (ON / OFF)'
+        required: true
+        type: choice
+        options:
+          - 'ON'
+          - 'OFF'
+        default: 'ON'
+      custom_duration:
+        description: 'Stream Duration (e.g., 3h, 180m, 45m, or 24/7)'
+        required: false
+        type: string
+        default: '24/7'
 
-# permissions:
-#   contents: write
-#   actions: write
+permissions:
+  contents: write
+  actions: write
 
-# jobs:
-#   stream:
-#     runs-on: ubuntu-latest
-#     timeout-minutes: 360
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
-#     steps:
-#       - name: Checkout Repository (2026 v6)
-#         uses: actions/checkout@v6
+    steps:
+      - name: Checkout Repository (2026 v6)
+        uses: actions/checkout@v6
 
-#       - name: Setup Node.js 24 LTS (2026 v6)
-#         uses: actions/setup-node@v6
-#         with:
-#           node-version: '24'
+      - name: Setup Node.js 24 LTS (2026 v6)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
 
-#       - name: Install System Dependencies, Openbox & OBS Studio
-#         run: |
-#           sudo apt-get update
-#           sudo apt-get install -y xvfb openbox pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl wget
-#           npm install
+      - name: Install System Dependencies, Openbox & OBS Studio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb openbox pulseaudio dbus-x11 obs-studio xdotool wmctrl jq unzip curl wget
+          npm install
 
-#       - name: Check Chrome and DRM Environment
-#         run: |
-#           echo "=== Chrome ==="
-#           google-chrome --version || true
+      - name: Check Chrome and DRM Environment
+        run: |
+          echo "=== Chrome ==="
+          google-chrome --version || true
 
-#           echo "=== Chromium ==="
-#           chromium --version || true
+          echo "=== Chromium ==="
+          chromium --version || true
 
-#           echo "=== Display ==="
-#           echo "Runner OS: $RUNNER_OS"
+          echo "=== Display ==="
+          echo "Runner OS: $RUNNER_OS"
 
-#           echo "=== Installed Browser ==="
-#           which google-chrome || true
-#           which chromium || true
+          echo "=== Installed Browser ==="
+          which google-chrome || true
+          which chromium || true
 
-#       - name: Install & Connect Cloudflare WARP Proxy
-#         if: github.event.inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
-#         continue-on-error: true
-#         run: |
-#           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-#           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-#           sudo apt-get update && sudo apt-get install -y cloudflare-warp
-#           warp-cli --accept-tos registration new || true
-#           warp-cli --accept-tos mode proxy || true
-#           warp-cli --accept-tos proxy port 40000 || true
-#           warp-cli --accept-tos connect || true
-#           sleep 5
-#           echo "[+] Cloudflare WARP Connected on SOCKS5 127.0.0.1:40000"
+      - name: Install & Connect Cloudflare WARP Proxy
+        if: github.event.inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
+        continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+          warp-cli --accept-tos registration new || true
+          warp-cli --accept-tos mode proxy || true
+          warp-cli --accept-tos proxy port 40000 || true
+          warp-cli --accept-tos connect || true
+          sleep 5
+          echo "[+] Cloudflare WARP Connected on SOCKS5 127.0.0.1:40000"
 
-#       - name: Fetch Latest 2026 uBlock Origin Lite (MV3)
-#         continue-on-error: true
-#         run: |
-#           mkdir -p ublock-lite
+      - name: Fetch Latest 2026 uBlock Origin Lite (MV3)
+        continue-on-error: true
+        run: |
+          mkdir -p ublock-lite
 
-#           # 1. Authenticated GitHub API call + Safe jq (.assets[]?) to prevent null error
-#           LATEST_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-#             https://api.github.com/repos/uBlockOrigin/uBOL-home/releases/latest \
-#             | jq -r '.assets[]? | select(.name | endswith(".chromium.zip")) | .browser_download_url' | head -n 1)
+          # 1. Authenticated GitHub API call + Safe jq (.assets[]?) to prevent null error
+          LATEST_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/uBlockOrigin/uBOL-home/releases/latest \
+            | jq -r '.assets[]? | select(.name | endswith(".chromium.zip")) | .browser_download_url' | head -n 1)
 
-#           # 2. Direct Fallback URL if API fails or returns empty/null
-#           if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
-#             echo "[!] GitHub API Null/Rate-Limited -> Using Direct Fallback URL..."
-#             LATEST_URL="https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.1110.1816/uBOLite_2026.1110.1816.chromium.zip"
-#           fi
+          # 2. Direct Fallback URL if API fails or returns empty/null
+          if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
+            echo "[!] GitHub API Null/Rate-Limited -> Using Direct Fallback URL..."
+            LATEST_URL="https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.1110.1816/uBOLite_2026.1110.1816.chromium.zip"
+          fi
 
-#           echo "[*] Downloading uBOLite from: $LATEST_URL"
+          echo "[*] Downloading uBOLite from: $LATEST_URL"
 
-#           # 3. Download with retry & extract without ever crashing the workflow
-#           curl -fL --retry 3 --retry-delay 2 -s "$LATEST_URL" -o ublock-lite.zip && \
-#           unzip -q -o ublock-lite.zip -d ublock-lite && \
-#           rm -f ublock-lite.zip && \
-#           echo "[+] Latest uBlock Origin Lite Extracted!" || echo "[!] Warning: uBOLite download failed, continuing stream without stopping job..."
+          # 3. Download with retry & extract without ever crashing the workflow
+          curl -fL --retry 3 --retry-delay 2 -s "$LATEST_URL" -o ublock-lite.zip && \
+          unzip -q -o ublock-lite.zip -d ublock-lite && \
+          rm -f ublock-lite.zip && \
+          echo "[+] Latest uBlock Origin Lite Extracted!" || echo "[!] Warning: uBOLite download failed, continuing stream without stopping job..."
 
-#       - name: Launch Virtual Display & Stream Engine
-#         env:
-#           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-#           TARGET_URLS: ${{ github.event.inputs.target_urls }}
-#           OKRU_STREAM_ID: ${{ github.event.inputs.okru_stream_channel }}
-#           SERVER_SELECTION: ${{ github.event.inputs.server_selection }}
-#           STREAM_QUALITY: ${{ github.event.inputs.stream_quality }}
-#           PROXY_ENGINE: ${{ github.event.inputs.proxy_engine }}
-#           ENABLE_STREAM_AUDIO: ${{ github.event.inputs.enable_stream_audio }}
-#           CUSTOM_DURATION: ${{ github.event.inputs.custom_duration }}
-#         run: |
-#           pulseaudio -D --exit-idle-time=-1
-#           pacmd load-module module-virtual-sink sink_name=v1
-#           pacmd set-default-sink v1
-#           pacmd set-default-source v1.monitor
+      - name: Launch Virtual Display & Stream Engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_URLS: ${{ github.event.inputs.target_urls }}
+          OKRU_STREAM_ID: ${{ github.event.inputs.okru_stream_channel }}
+          SERVER_SELECTION: ${{ github.event.inputs.server_selection }}
+          STREAM_QUALITY: ${{ github.event.inputs.stream_quality }}
+          PROXY_ENGINE: ${{ github.event.inputs.proxy_engine }}
+          ENABLE_STREAM_AUDIO: ${{ github.event.inputs.enable_stream_audio }}
+          CUSTOM_DURATION: ${{ github.event.inputs.custom_duration }}
+        run: |
+          pulseaudio -D --exit-idle-time=-1
+          pacmd load-module module-virtual-sink sink_name=v1
+          pacmd set-default-sink v1
+          pacmd set-default-source v1.monitor
 
-#           # Match Xvfb screen size with selected stream quality
-#           SCREEN_RES="1280x720x24"
-#           if [[ "$STREAM_QUALITY" == *"1080p"* ]]; then SCREEN_RES="1920x1080x24"; fi
-#           if [[ "$STREAM_QUALITY" == "480p" ]]; then SCREEN_RES="854x480x24"; fi
-#           if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
+          # Match Xvfb screen size with selected stream quality
+          SCREEN_RES="1280x720x24"
+          if [[ "$STREAM_QUALITY" == *"1080p"* ]]; then SCREEN_RES="1920x1080x24"; fi
+          if [[ "$STREAM_QUALITY" == "480p" ]]; then SCREEN_RES="854x480x24"; fi
+          if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
 
-#           xvfb-run -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
+          xvfb-run -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
 
 
 
